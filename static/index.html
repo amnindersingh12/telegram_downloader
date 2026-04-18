@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TGrab — Telegram Media Downloader</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body class="idx-page">
+
+  <!-- Auth -->
+  <div id="va" class="view active">
+    <div class="card">
+      <div class="logo">
+        <div class="logo-icon">📡</div>
+        <div>
+          <div class="logo-text">TGrab</div>
+          <div class="logo-sub">Telegram Media Downloader</div>
+        </div>
+      </div>
+      <h2>Connect to Telegram</h2>
+      <p class="sub">Credentials from <a href="https://my.telegram.org" target="_blank">my.telegram.org</a></p>
+      <div class="err" id="ae"></div>
+      <div class="f"><label>API ID</label><input id="aid" type="number" placeholder="12345678"></div>
+      <div class="f"><label>API Hash</label><input id="ahs" type="text" placeholder="0123456789abcdef…"></div>
+      <div class="f"><label>Phone Number</label><input id="aph" type="tel" placeholder="+919876543210">
+        <div class="hint">Include country code</div>
+      </div>
+      <button class="btn btn-p" id="abt" onclick="doAuth()">Send OTP →</button>
+    </div>
+  </div>
+
+  <!-- OTP -->
+  <div id="vo" class="view">
+    <div class="card">
+      <div class="logo">
+        <div class="logo-icon">🔐</div>
+        <div>
+          <div class="logo-text">Verify OTP</div>
+          <div class="logo-sub">Check your Telegram app</div>
+        </div>
+      </div>
+      <h2>Enter the code</h2>
+      <p class="sub" id="osub">Telegram sent a code to your Telegram app.</p>
+      <div class="err" id="oe"></div>
+      <div class="f"><label>OTP Code</label><input id="ocode" type="text" placeholder="12345" maxlength="8"></div>
+      <div class="twofa" id="twof">
+        <div class="f"><label>2FA Password</label>
+          <input id="tpwd" type="password" placeholder="Cloud password">
+        </div>
+      </div>
+      <button class="btn btn-p" id="obt" onclick="doOtp()">Verify →</button>
+      <button class="btn btn-g" onclick="sv('va')">← Back</button>
+    </div>
+  </div>
+
+  <!-- App -->
+  <div id="vapp" class="view">
+    <div class="topbar">
+      <div class="logo-icon" style="width:30px;height:30px;font-size:14px">📡</div>
+      <div class="logo-text" style="font-size:15px">TGrab</div>
+      <div class="tsp"></div>
+      <div style="font-size:11px;color:var(--muted)">⌘A select all · ⌘↵ download · Esc close · ? shortcuts</div>
+      <div class="status-pill">● Connected</div>
+      <button class="btn btn-g" style="width:auto;padding:5px 13px;margin:0;font-size:12px"
+        onclick="doLogout()">Logout</button>
+    </div>
+
+    <div class="ws">
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <div class="stabs">
+          <div class="stab active" onclick="switchSTab('channels',this)">📡 Channels</div>
+          <div class="stab" onclick="switchSTab('external',this)">🌐 External</div>
+        </div>
+
+        <!-- Channels pane -->
+        <div class="sidebar-pane active" id="sp-channels">
+          <div class="ss">
+            <div class="sw"><span class="si">🔍</span>
+              <input type="text" placeholder="Search channels…" oninput="filterChs(this.value)">
+            </div>
+          </div>
+          <div class="cl" id="chlist">
+            <div style="padding:8px;display:grid;gap:6px">
+              <div class="sk" style="height:56px"></div>
+              <div class="sk" style="height:56px"></div>
+              <div class="sk" style="height:56px"></div>
+              <div class="sk" style="height:56px"></div>
+            </div>
+          </div>
+          <div class="sf">
+            <button class="vbtn" id="vmbtn" disabled style="cursor:default;opacity:.7">0 selected</button>
+          </div>
+        </div>
+
+        <!-- External pane -->
+        <div class="sidebar-pane" id="sp-external">
+          <div class="ext-pane">
+            <div class="f" style="margin:0"><label>URL</label>
+              <textarea id="ext-url"
+                placeholder="https://youtube.com/watch?v=…&#10;https://instagram.com/reel/…"></textarea>
+            </div>
+            <select id="ext-fmt">
+              <option value="video">🎬 Video (best quality)</option>
+              <option value="audio">🎵 Audio only (MP3)</option>
+            </select>
+            <button class="btn btn-p" onclick="doYtdlp()">⬇ Download</button>
+          </div>
+          <div class="ext-history" id="ext-history"></div>
+        </div>
+      </div>
+
+      <!-- Main -->
+      <div class="main">
+        <div class="toolbar">
+          <div class="t1">
+            <div class="pills">
+              <button class="pill active" onclick="setFilter('all',this)">All</button>
+              <button class="pill" onclick="setFilter('photo',this)">📷 Photos</button>
+              <button class="pill" onclick="setFilter('video',this)">🎬 Videos</button>
+              <button class="pill" onclick="setFilter('document',this)">📄 Docs</button>
+            </div>
+            <div class="tsp2"></div>
+            <div class="search-wrap"><span class="si">🔍</span>
+              <input type="text" id="msearch" placeholder="Search files…">
+            </div>
+            <select class="sort" onchange="sortMedia(this.value)">
+              <option value="">Sort…</option>
+              <option value="date-desc">Newest first</option>
+              <option value="date-asc">Oldest first</option>
+              <option value="size-desc">Largest first</option>
+              <option value="size-asc">Smallest first</option>
+            </select>
+            <button class="ibox-btn" onclick="selAll()">Select All</button>
+            <button class="ibox-btn" id="vwtbtn" onclick="toggleView()">☷ Grid view</button>
+          </div>
+        </div>
+
+        <!-- Stream status bar -->
+        <div class="stream-bar" id="sbar">
+          <div class="sb-dot"></div>
+          <span id="sbar-txt">Loading…</span>
+          <div class="tsp2"></div>
+          <button class="pause-btn" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
+        </div>
+
+        <!-- Empty / grid -->
+        <div class="empty" id="empty">
+          <div class="empty-icon">📡</div>
+          <div style="font-size:14px;font-weight:500">No media loaded</div>
+          <div style="font-size:12px;opacity:.6">Select channels and click "View Media"</div>
+          <div style="font-size:11px;opacity:.4;margin-top:4px">Tip: ⌘A to select all · ⌘↵ to download</div>
+        </div>
+        <div class="media-grid gallery-mode" id="mgrid" style="display:none"></div>
+      </div>
+
+      <!-- Progress drawer -->
+      <div class="pd" id="pdrawer">
+        <div class="dh"><span>📥</span><span class="dt">Downloads</span>
+          <button class="dc" onclick="closeDr()">✕</button>
+        </div>
+        <div class="pl" id="plist"></div>
+      </div>
+    </div>
+
+    <!-- Bottom bar -->
+    <div class="bb">
+      <div class="bbc">Selected: <span id="selc">0</span></div>
+      <div class="tsp"></div>
+      <button class="ibox-btn" style="padding:10px 16px;font-size:13px" onclick="doDl()" id="dlbtn2">⬇ Download
+        selected</button>
+      <button class="dlbtn" id="dlbtn" disabled onclick="doDl()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="7 10 12 15 17 10" />
+          <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>Download
+      </button>
+    </div>
+  </div>
+
+  <!-- Native lightbox -->
+  <div id="lb" class="lb">
+    <div class="lb-bg" id="lb-bg"></div>
+    <div class="lb-content" id="lb-content"></div>
+    <button class="lb-close" id="lb-close">✕</button>
+    <button class="lb-nav lb-prev" id="lb-prev">&#8249;</button>
+    <button class="lb-nav lb-next" id="lb-next">&#8250;</button>
+    <div class="lb-info" id="lb-info"></div>
+  </div>
+
+  <!-- Toasts -->
+  <div id="toasts"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

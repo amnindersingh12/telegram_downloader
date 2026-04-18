@@ -1,0 +1,13 @@
+*.session
+*.session-journal
+tg_creds.json
+cache.db
+downloads/
+__pycache__/
+cache
+previews/
+*.pyc
+venv/
+.venv/
+.env
+*.db*
