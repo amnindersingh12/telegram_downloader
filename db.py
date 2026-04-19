@@ -30,6 +30,7 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS media (
             channel_id INTEGER, msg_id INTEGER, type TEXT,
             filename TEXT, size INTEGER, date TEXT, caption TEXT DEFAULT '',
+            w INTEGER DEFAULT 0, h INTEGER DEFAULT 0,
             PRIMARY KEY (channel_id, msg_id)
         );
         CREATE TABLE IF NOT EXISTS downloads (
@@ -87,9 +88,10 @@ def _db_cache_media_batch(items: list[dict]) -> None:
         return
     with _db_connect() as c:
         c.executemany(
-            "INSERT OR IGNORE INTO media VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO media (channel_id, msg_id, type, filename, size, date, caption, w, h) VALUES (?,?,?,?,?,?,?,?,?)",
             [(i["channel_id"], i["msg_id"], i["type"],
-              i["filename"], i["size"], i.get("date"), i.get("caption", ""))
+              i["filename"], i["size"], i.get("date"), i.get("caption", ""),
+              i.get("w", 0), i.get("h", 0))
              for i in items],
         )
 
