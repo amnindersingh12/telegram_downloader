@@ -5,6 +5,7 @@
 #   "telethon>=1.36",
 #   "fastapi>=0.115",
 #   "uvicorn[standard]>=0.32",
+#   "yt-dlp",
 # ]
 # ///
 """

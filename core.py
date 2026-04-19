@@ -1,4 +1,4 @@
-import asyncio, json, logging, re, sys
+import asyncio, json, logging, os, re, sys
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -333,44 +333,70 @@ async def _run_download(job_id: str, items: list[dict]) -> None:
 
 
 async def _run_ytdlp(job_id: str, url: str, fmt: str) -> None:
+    import shutil
     job = st.jobs[job_id]
     cancel = st.cancel_evts[job_id]
     out_dir = DOWNLOADS / "external"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fmt_arg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    if fmt == "audio":
-        fmt_arg = "bestaudio/best"
+    # Prefer yt-dlp binary, fallback to python -m
+    ytdlp_bin = shutil.which("yt-dlp")
+    if ytdlp_bin:
+        cmd = [ytdlp_bin]
+    else:
+        cmd = [sys.executable, "-m", "yt_dlp"]
 
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--newline", "--no-playlist",
-        "-f", fmt_arg,
-        "-o", str(out_dir / "%(title)s.%(ext)s"),
-        url,
-    ]
+    cmd += ["--newline", "--no-playlist",
+            "-o", str(out_dir / "%(title)s.%(ext)s")]
+
+    if fmt == "audio":
+        # Best audio → extract to mp3
+        cmd += ["-f", "bestaudio/best",
+                "--extract-audio", "--audio-format", "mp3"]
+    else:
+        # Max quality video+audio → remux to mp4
+        cmd += ["-f", "bv*+ba/b",
+                "--merge-output-format", "mp4",
+                "--remux-video", "mp4"]
+
+    cmd.append(url)
 
     job.update({"status": "running", "url": url, "current": "Starting…", "pct": 0})
     prog_re = re.compile(r"\[download\]\s+([\d.]+)%")
+    last_line = ""
 
     try:
+        # Ensure ffmpeg is on PATH for merge/remux/extract
+        env = os.environ.copy()
+        env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
         async for raw in proc.stdout:
             if cancel.is_set():
                 proc.terminate()
                 break
             line = raw.decode(errors="ignore").strip()
+            if line:
+                last_line = line
             m = prog_re.search(line)
             if m:
                 job["pct"] = float(m.group(1))
                 job["current"] = line
-        await proc.wait()
-        job.update({"status": "done" if not cancel.is_set() else "cancelled",
-                    "pct": 100, "current": None})
+            elif line.startswith("ERROR"):
+                job["current"] = line
+        rc = await proc.wait()
+        if cancel.is_set():
+            job.update({"status": "cancelled", "pct": 0, "current": None})
+        elif rc != 0:
+            job.update({"status": "error", "current": last_line or f"yt-dlp exited with code {rc}"})
+        else:
+            job.update({"status": "done", "pct": 100, "current": None})
+    except FileNotFoundError:
+        job.update({"status": "error", "current": "yt-dlp not found — install with: pip install yt-dlp"})
     except Exception as e:
         job.update({"status": "error", "current": str(e)})
     finally:
