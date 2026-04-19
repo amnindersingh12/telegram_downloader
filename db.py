@@ -49,6 +49,20 @@ def _db_init() -> None:
             c.execute("ALTER TABLE media ADD COLUMN w INTEGER DEFAULT 0")
         if "h" not in cols:
             c.execute("ALTER TABLE media ADD COLUMN h INTEGER DEFAULT 0")
+        
+        # Migration: Ensure channel IDs are marked (negative) as per Telethon standard.
+        # This fixes issues with private channels where positive IDs are ambiguous.
+        rows = c.execute("SELECT id, type FROM channels WHERE id > 0").fetchall()
+        for r in rows:
+            old_id = r["id"]
+            if r["type"] == "channel":
+                new_id = int("-100" + str(old_id))
+            else: # group
+                new_id = -old_id
+            
+            c.execute("UPDATE channels SET id=? WHERE id=?", (new_id, old_id))
+            c.execute("UPDATE media SET channel_id=? WHERE channel_id=?", (new_id, old_id))
+            c.execute("UPDATE downloads SET channel_id=? WHERE channel_id=?", (new_id, old_id))
 
 
 async def _db_run(fn: Callable) -> Any:

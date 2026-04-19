@@ -48,7 +48,7 @@ from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
 import uvicorn
 
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, utils
 from telethon.tl import types
 from telethon.tl.types import (
     InputMessagesFilterPhotos,
@@ -239,13 +239,16 @@ async def stream_channels(request: Request):
             e = d.entity
             if not isinstance(e, (types.Channel, types.Chat)):
                 continue
+            
+            # Use marked IDs (negative) to avoid Peer ID ambiguity and leverage Telethon's cache
+            m_id = utils.get_peer_id(e)
             ch = {
-                "id": e.id,
+                "id": m_id,
                 "title": getattr(e, "title", "?"),
                 "type": "channel" if isinstance(e, types.Channel) else "group",
                 "members": getattr(e, "participants_count", None),
                 "username": getattr(e, "username", None),
-                "folders": folder_map.get(e.id, []),
+                "folders": folder_map.get(m_id, []) or folder_map.get(e.id, []), # Try both
             }
             await _db_run(lambda c=ch: _db_upsert_channel(c))
             yield f"data: {json.dumps(ch)}\n\n"
@@ -344,8 +347,8 @@ async def get_thumb(channel_id: int, msg_id: int):
             t_path.write_bytes(thumb_bytes)
             return Response(thumb_bytes, media_type="image/jpeg", 
                             headers={"Cache-Control": "public, max-age=604800"})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to fetch thumbnail for {channel_id}_{msg_id}: {e}", exc_info=True)
     
     raise HTTPException(404, "Thumbnail unavailable")
 
@@ -394,7 +397,8 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
             return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
         
         async def _stream() -> AsyncGenerator[bytes, None]:
-            async for chunk in c.iter_download(msg.media, request_size=128*1024):
+            # Use msg instead of msg.media to provide context for protected content
+            async for chunk in c.iter_download(msg, request_size=128*1024):
                 if await request.is_disconnected():
                     break
                 yield chunk
@@ -445,7 +449,8 @@ async def get_file(channel_id: int, msg_id: int, request: Request):
 
         # For videos/documents, stream chunk by chunk
         async def _stream() -> AsyncGenerator[bytes, None]:
-            async for chunk in c.iter_download(msg.media, request_size=256 * 1024):
+            # Use msg instead of msg.media to provide context for protected content
+            async for chunk in c.iter_download(msg, request_size=256 * 1024):
                 if await request.is_disconnected():
                     break
                 yield chunk

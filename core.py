@@ -50,7 +50,10 @@ st = _State()
 
 
 def _mk_client(api_id: int, api_hash: str) -> TelegramClient:
-    return TelegramClient(str(SESSION), api_id, api_hash)
+    return TelegramClient(str(SESSION), api_id, api_hash, 
+                          device_model="Desktop", 
+                          system_version="Linux",
+                          app_version="TGrab 1.0")
 
 
 async def _client() -> TelegramClient:
@@ -207,13 +210,12 @@ async def _media_sse(
 
     for cid in channel_ids:
         try:
-            entity = await c.get_entity(types.PeerChannel(cid))
-        except Exception:
-            try:
-                entity = await c.get_entity(cid)
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e), 'channel_id': cid})}\n\n"
-                continue
+            # Marked IDs (negative) allow get_entity to perfectly resolve from session cache
+            entity = await c.get_entity(cid)
+        except Exception as e:
+            logger.error(f"Could not resolve entity for ID {cid}: {e}")
+            yield f"data: {json.dumps({'error': str(e), 'channel_id': cid})}\n\n"
+            continue
 
         # Check cache first for this channel
         cached = await _db_read(lambda: _db_get_media(cid, mtype))
