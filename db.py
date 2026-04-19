@@ -37,6 +37,19 @@ def _db_init() -> None:
             channel_id INTEGER, msg_id INTEGER, filepath TEXT,
             downloaded_at REAL, PRIMARY KEY (channel_id, msg_id)
         );
+        CREATE TABLE IF NOT EXISTS mirrors (
+            id TEXT PRIMARY KEY, source_id INTEGER, target_id INTEGER,
+            last_msg_id INTEGER DEFAULT 0, status TEXT, 
+            total INTEGER DEFAULT 0, current INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS mirrored_messages (
+            source_id INTEGER, source_msg_id INTEGER, target_id INTEGER,
+            PRIMARY KEY (source_id, source_msg_id, target_id)
+        );
+        CREATE TABLE IF NOT EXISTS sync_rules (
+            source_id INTEGER, target_id INTEGER,
+            PRIMARY KEY (source_id, target_id)
+        );
         CREATE INDEX IF NOT EXISTS idx_media_channel ON media(channel_id, msg_id DESC);
         CREATE INDEX IF NOT EXISTS idx_media_type ON media(channel_id, type);
         CREATE INDEX IF NOT EXISTS idx_downloads_lookup ON downloads(channel_id, msg_id);
@@ -148,3 +161,39 @@ def _db_is_downloaded(channel_id: int, msg_id: int) -> Optional[str]:
             (channel_id, msg_id)
         ).fetchone()
         return row["filepath"] if row else None
+
+def _db_upsert_mirror(m: dict) -> None:
+    with _db_connect() as c:
+        c.execute("""
+            INSERT INTO mirrors (id, source_id, target_id, last_msg_id, status, total, current)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET 
+                status=excluded.status, total=excluded.total, current=excluded.current, last_msg_id=excluded.last_msg_id
+        """, (m["id"], m["source_id"], m["target_id"], m.get("last_msg_id", 0), m["status"], m["total"], m["current"]))
+
+def _db_get_mirrors() -> list[dict]:
+    with _db_connect() as c:
+        rows = c.execute("SELECT * FROM mirrors ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+def _db_is_mirrored(src_id: int, src_msg_id: int, dst_id: int) -> bool:
+    with _db_connect() as c:
+        row = c.execute("SELECT 1 FROM mirrored_messages WHERE source_id=? AND source_msg_id=? AND target_id=?", (src_id, src_msg_id, dst_id)).fetchone()
+        return bool(row)
+
+def _db_add_mirror_mapping(src_id: int, src_msg_id: int, dst_id: int) -> None:
+    with _db_connect() as c:
+        c.execute("INSERT OR IGNORE INTO mirrored_messages (source_id, source_msg_id, target_id) VALUES (?, ?, ?)", (src_id, src_msg_id, dst_id))
+
+def _db_get_sync_rules() -> list[dict]:
+    with _db_connect() as c:
+        rows = c.execute("SELECT * FROM sync_rules").fetchall()
+        return [dict(r) for r in rows]
+
+def _db_add_sync_rule(src_id: int, dst_id: int) -> None:
+    with _db_connect() as c:
+        c.execute("INSERT OR IGNORE INTO sync_rules (source_id, target_id) VALUES (?, ?)", (src_id, dst_id))
+
+def _db_remove_sync_rule(src_id: int, dst_id: int) -> None:
+    with _db_connect() as c:
+        c.execute("DELETE FROM sync_rules WHERE source_id=? AND target_id=?", (src_id, dst_id))

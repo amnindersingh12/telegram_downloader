@@ -70,11 +70,11 @@
     </div>
 
     <div class="ws">
-      <!-- Sidebar -->
       <div class="sidebar">
         <div class="stabs">
           <div class="stab active" onclick="switchSTab('channels',this)">📡 Channels</div>
           <div class="stab" onclick="switchSTab('external',this)">🌐 External</div>
+          <div class="stab" onclick="switchSTab('mirror',this)">👯 Mirror</div>
         </div>
 
         <!-- Channels pane -->
@@ -113,8 +113,35 @@
           </div>
           <div class="ext-history" id="ext-history"></div>
         </div>
-      </div>
 
+        <!-- Mirror pane -->
+        <div class="sidebar-pane" id="sp-mirror">
+          <div class="ext-pane">
+            <div class="f"><label>Source Channel(s) (IDs or Usernames, comma-separated)</label>
+              <input type="text" id="mir-src" placeholder="@src1, @src2, -100..." list="ch-datalist-all">
+            </div>
+            <div class="f"><label>Target Channel (Destination)</label>
+              <input type="text" id="mir-dst" placeholder="@target_channel" list="ch-datalist-target">
+            </div>
+            <datalist id="ch-datalist-all"></datalist>
+            <datalist id="ch-datalist-target"></datalist>
+            <div class="f"><label>Limit (Optional)</label>
+              <input type="number" id="mir-lim" placeholder="e.g. 100 (leave empty for all)">
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+              <input type="checkbox" id="mir-sync" style="width:auto">
+              <label for="mir-sync" style="margin:0;cursor:pointer">Live Sync (Auto-clone new messages)</label>
+            </div>
+            <p style="font-size:10px;color:var(--muted);margin-bottom:12px">Clones messages from source to target. Supports protected (noforwards) content.</p>
+            <button class="btn btn-p" onclick="doMirror()">👯 Start Mirroring</button>
+          </div>
+          <div style="margin:20px 15px 10px;font-size:12px;font-weight:600;color:var(--muted)">Active & Past Mirrors</div>
+          <div class="ext-history" id="mir-history"></div>
+          <div style="margin:20px 15px 10px;font-size:12px;font-weight:600;color:var(--muted)">Active Sync Rules</div>
+          <div id="mir-syncs" style="padding:0 15px"></div>
+        </div>
+      </div>
+      <div class="gutter" id="gutter"></div>
       <!-- Main -->
       <div class="main">
         <div class="toolbar">

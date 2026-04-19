@@ -11,7 +11,9 @@ from telethon.tl.types import (
 )
 from config import SESSION, DOWNLOADS, THUMB_CACHE_SIZE, MAX_CONCURRENT_DOWNLOADS, JOB_TTL_SECONDS
 from db import _db_run, _db_read, _db_get_media, _db_last_msg_id, _db_cache_media, \
-    _db_is_downloaded, _db_mark_downloaded, _db_cache_media_batch
+    _db_is_downloaded, _db_mark_downloaded, _db_cache_media_batch, _db_upsert_mirror, \
+    _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
+from telethon import TelegramClient, errors, events
 
 logger = logging.getLogger("tgrab")
 
@@ -44,9 +46,48 @@ class _State:
     phone_hash:  Optional[str]  = None
     jobs:        dict[str, dict] = {}
     cancel_evts: dict[str, asyncio.Event] = {}
+    sync_map:    dict[int, set[int]] = {} # source_id -> {target_ids}
     thumbs:      LRU = LRU(THUMB_CACHE_SIZE)
 
 st = _State()
+
+
+@events.register(events.NewMessage)
+async def _on_new_message(event):
+    src_id = event.chat_id
+    if src_id not in st.sync_map: return
+    
+    m = event.message
+    targets = st.sync_map[src_id]
+    
+    for dst_id in targets:
+        try:
+            # Check for duplicate (though NewMessage shouldn't be duplicate, it's safe)
+            if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)): continue
+
+            try:
+                await event.client.send_message(dst_id, m, comment_to=None)
+            except errors.ChatForwardsRestrictedError:
+                if m.media:
+                    from io import BytesIO
+                    import mimetypes
+                    bio = BytesIO()
+                    await event.client.download_media(m, bio)
+                    bio.seek(0)
+                    fn = m.file.name
+                    doc = getattr(m.media, 'document', None)
+                    if not fn and doc and doc.mime_type:
+                        ex = mimetypes.guess_extension(doc.mime_type)
+                        if ex: fn = f"sync_{m.id}{ex}"
+                    bio.name = fn or f"sync_{m.id}"
+                    await event.client.send_file(dst_id, bio, caption=m.message, formatting_entities=m.entities, attributes=doc.attributes if doc else [])
+                else:
+                    await event.client.send_message(dst_id, m.message, formatting_entities=m.entities)
+            
+            await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+            logger.info(f"Live Sync: Cloned {src_id} -> {dst_id}")
+        except Exception as e:
+            logger.error(f"Live Sync Error: {e}")
 
 
 def _mk_client(api_id: int, api_hash: str) -> TelegramClient:
@@ -59,16 +100,51 @@ def _mk_client(api_id: int, api_hash: str) -> TelegramClient:
 async def _client() -> TelegramClient:
     if not st.client:
         raise HTTPException(503, "Not authenticated")
+
     if not st.client.is_connected():
         try:
             await st.client.connect()
             if not await st.client.is_user_authorized():
                 raise HTTPException(503, "Session expired — please re-login")
+            
+            # Re-register event handler on reconnect
+            st.client.add_event_handler(_on_new_message)
+            
+            # Load sync rules if never loaded
+            if not st.sync_map:
+                rules = await _db_run(_db_get_sync_rules)
+                for r in rules:
+                    sid, tid = r["source_id"], r["target_id"]
+                    if sid not in st.sync_map: st.sync_map[sid] = set()
+                    st.sync_map[sid].add(tid)
+                    logger.info(f"Auto-Sync enabled: {sid} -> {tid}")
         except HTTPException:
             raise
         except Exception:
             raise HTTPException(503, "Failed to reconnect to Telegram")
     return st.client
+
+
+async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
+    """Try to get entity. If ID-based lookups fail, sweep dialogs to find and cache it."""
+    try:
+        return await client.get_entity(peer)
+    except Exception:
+        # Only sweep if peer looks like an ID
+        is_id = False
+        pid = 0
+        if isinstance(peer, (int, float)):
+            is_id = True; pid = int(peer)
+        elif isinstance(peer, str):
+            clean = peer.lstrip('-')
+            if clean.isdigit(): is_id = True; pid = int(peer)
+        
+        if is_id:
+            logger.info(f"Entity {pid} not in cache — sweeping dialogs...")
+            async for d in client.iter_dialogs(limit=None):
+                if d.id == pid:
+                    return d.entity
+        raise
 
 
 async def _iter_with_retry(client, entity, max_retries=3, **kwargs):
@@ -211,7 +287,7 @@ async def _media_sse(
     for cid in channel_ids:
         try:
             # Marked IDs (negative) allow get_entity to perfectly resolve from session cache
-            entity = await c.get_entity(cid)
+            entity = await _get_entity_robust(c, cid)
         except Exception as e:
             logger.error(f"Could not resolve entity for ID {cid}: {e}")
             yield f"data: {json.dumps({'error': str(e), 'channel_id': cid})}\n\n"
@@ -400,6 +476,119 @@ async def _run_ytdlp(job_id: str, url: str, fmt: str) -> None:
     except FileNotFoundError:
         job.update({"status": "error", "current": "yt-dlp not found — install with: pip install yt-dlp"})
     except Exception as e:
+        job.update({"status": "error", "current": str(e)})
+    finally:
+        st.cancel_evts.pop(job_id, None)
+        asyncio.create_task(_cleanup_job(job_id))
+
+
+async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int]) -> None:
+    c = await _client()
+    job = st.jobs[job_id]
+    cancel = st.cancel_evts[job_id]
+    job.update({
+        "status": "running", "total": 0, "done": 0, "pct": 0, 
+        "source_id": src_id, "target_id": dst_id, "logs": []
+    })
+    
+    def log(msg):
+        logger.info(f"[{job_id}] {msg}")
+        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[:50]
+        # Auto-upsert status to DB
+        asyncio.create_task(_db_run(lambda: _db_upsert_mirror({
+            "id": job_id, "source_id": src_id, "target_id": dst_id,
+            "status": job["status"], "total": job["total"], "current": job.get("current"),
+            "last_msg_id": job.get("last_msg_id", 0)
+        })))
+
+    try:
+        log(f"Starting mirror from {src_id} to {dst_id}")
+        src = await _get_entity_robust(c, src_id)
+        dst = await _get_entity_robust(c, dst_id)
+        
+        # 1. Collect messages
+        log("Fetching messages...")
+        msgs = []
+        async for m in c.iter_messages(src, limit=limit, reverse=True):
+            if cancel.is_set(): break
+            if isinstance(m.action, types.MessageActionEmpty) or not m.action:
+                msgs.append(m)
+        
+        if not msgs:
+            log("No messages found.")
+            job.update({"status": "done", "pct": 100})
+            return
+
+        job["total"] = len(msgs)
+        log(f"Found {len(msgs)} messages. Starting clone...")
+        
+        # 2. Clone loop
+        for i, m in enumerate(msgs):
+            if cancel.is_set(): break
+            
+            # Deduplication Check
+            if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)):
+                log(f"Skipping duplicate msg {m.id}")
+                job["done"] = i + 1
+                job["pct"] = round((i + 1) / job["total"] * 100, 1)
+                continue
+
+            try:
+                # as_copy=True fallback via send_message
+                await c.send_message(dst, m, comment_to=None)
+                log(f"Cloned msg {m.id}")
+            except errors.ChatForwardsRestrictedError:
+                log(f"Msg {m.id} is protected. Re-uploading...")
+                if m.media:
+                    from io import BytesIO
+                    import mimetypes
+                    bio = BytesIO()
+                    await c.download_media(m, bio)
+                    bio.seek(0)
+                    
+                    # 1. Try m.file.name (strongest)
+                    fn = m.file.name
+                    
+                    # 2. Try attributes fallback
+                    doc = getattr(m.media, 'document', None)
+                    attrs = doc.attributes if doc else []
+                    if not fn and doc:
+                        for a in attrs:
+                            if hasattr(a, 'file_name'): fn = a.file_name; break
+                    
+                    # 3. Guess extension from mime type
+                    if not fn and doc and doc.mime_type:
+                        ext = mimetypes.guess_extension(doc.mime_type)
+                        if ext: fn = f"file_{m.id}{ext}"
+                    
+                    # 4. Final generic fallbacks
+                    if not fn:
+                        if isinstance(m.media, types.MessageMediaPhoto): fn = f"image_{m.id}.jpg"
+                        else: fn = f"file_{m.id}.dat"
+
+                    bio.name = fn
+                    await c.send_file(dst, bio, caption=m.message, formatting_entities=m.entities, attributes=attrs)
+                    log(f"Synced: {fn}")
+                else:
+                    await c.send_message(dst, m.message, formatting_entities=m.entities)
+                    log(f"Synced text: {m.id}")
+                
+                # Save mapping to prevent future duplicates
+                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+            except Exception as e:
+                log(f"Failed msg {m.id}: {e}")
+            
+            job["done"] = i + 1
+            job["pct"] = round((i + 1) / job["total"] * 100, 1)
+            job["last_msg_id"] = m.id
+            if (i+1) % 5 == 0: log(f"Progress: {i+1}/{len(msgs)}")
+            await asyncio.sleep(0.1) # Faster with high RAM and optimized concurrency
+
+        job["status"] = "done" if not cancel.is_set() else "cancelled"
+        log(f"Job {job['status']}")
+
+    except Exception as e:
+        logger.error(f"Mirror job {job_id} failed: {e}", exc_info=True)
         job.update({"status": "error", "current": str(e)})
     finally:
         st.cancel_evts.pop(job_id, None)

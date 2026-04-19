@@ -266,6 +266,33 @@ input:focus {
   overflow: hidden;
 }
 
+.gutter {
+  width: 8px;
+  margin: 0 -4px;
+  background: transparent;
+  cursor: col-resize;
+  transition: background .2s;
+  flex-shrink: 0;
+  z-index: 1000; /* Ensure it stays above everything */
+  position: relative;
+}
+.gutter:hover, .gutter.active {
+  background: var(--adim);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.gutter::after {
+  content: "";
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px; height: 32px;
+  background: var(--muted);
+  border-radius: 1px;
+  opacity: 0.3;
+  pointer-events: none;
+}
+.gutter.active::after { background: var(--accent); opacity: 1; }
+
 
 /* ============================================================
    SIDEBAR
@@ -651,6 +678,7 @@ select.sort {
   background: var(--panel);
   border: 2px solid transparent;
   transition: border-color .15s, box-shadow .15s;
+  animation: fadeUp 0.4s ease-out;
   content-visibility: auto;
   contain-intrinsic-size: 152px;
   contain: layout style;
@@ -791,7 +819,6 @@ select.sort {
 
 /* Gallery mode */
 /* Gallery mode — card sizing handled by virtual scroller */
-.gallery-mode {}
 .gallery-mode .mc         { cursor: zoom-in; }
 .gallery-mode .mchk       { display: flex !important; }
 .gallery-mode .mc.sel     { border-color: var(--accent); box-shadow: 0 0 15px var(--adim); }
@@ -1293,3 +1320,16 @@ header {
   from { opacity: 0; transform: translateY(28px) scale(.97); }
   to   { opacity: 1; transform: none; }
 }
+
+.m-logs {
+  background: rgba(0,0,0,.3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-top: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 10px;
+  color: var(--muted);
+}
+.m-logs div { border-bottom: 1px solid rgba(255,255,255,.03); padding: 2px 0; }

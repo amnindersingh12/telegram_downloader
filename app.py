@@ -58,9 +58,9 @@ from telethon.tl.types import (
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
-from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded
-from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, \
-    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size
+from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_add_sync_rule, _db_remove_sync_rule
+from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, _run_mirror, \
+    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -242,13 +242,21 @@ async def stream_channels(request: Request):
             
             # Use marked IDs (negative) to avoid Peer ID ambiguity and leverage Telethon's cache
             m_id = utils.get_peer_id(e)
+            
+            # Check for posting privileges (Creator or Admin with post rights)
+            is_creator = getattr(e, "creator", False)
+            admin_rights = getattr(e, "admin_rights", None)
+            is_admin = bool(admin_rights and admin_rights.post_messages) if admin_rights else is_creator
+
             ch = {
                 "id": m_id,
                 "title": getattr(e, "title", "?"),
                 "type": "channel" if isinstance(e, types.Channel) else "group",
                 "members": getattr(e, "participants_count", None),
                 "username": getattr(e, "username", None),
-                "folders": folder_map.get(m_id, []) or folder_map.get(e.id, []), # Try both
+                "folders": folder_map.get(m_id, []) or folder_map.get(e.id, []), 
+                "is_creator": is_creator,
+                "can_post": is_admin or is_creator,
             }
             await _db_run(lambda c=ch: _db_upsert_channel(c))
             yield f"data: {json.dumps(ch)}\n\n"
@@ -502,7 +510,16 @@ async def download_progress(job_id: str, request: Request):
             if await request.is_disconnected():
                 break
             job = st.jobs[job_id]
-            yield f"data: {json.dumps(job)}\n\n"
+            # Copy to avoid mutation issues during JSON serialization
+            data = {
+                "status": job["status"],
+                "pct": job["pct"],
+                "done": job.get("done", 0),
+                "total": job.get("total", 0),
+                "current": job.get("current"),
+                "logs": job.get("logs", [])
+            }
+            yield f"data: {json.dumps(data)}\n\n"
             if job["status"] in ("done", "cancelled", "error"):
                 break
             await asyncio.sleep(0.4)
@@ -524,6 +541,64 @@ async def start_ytdlp(body: YtReq) -> dict[str, str]:
     st.cancel_evts[job_id] = asyncio.Event()
     asyncio.create_task(_run_ytdlp(job_id, body.url, body.fmt))
     return {"job_id": job_id}
+
+
+# ── Channel Mirroring ────────────────────────────────────────────────────────
+class MirrorReq(BaseModel):
+    source_id: Union[int, str]
+    target_id: Union[int, str]
+    limit: Optional[int] = None
+
+
+@app.post("/api/mirror/start")
+async def start_mirror(body: MirrorReq) -> dict[str, str]:
+    job_id = f"mirror_{uuid.uuid4().hex[:8]}"
+    st.jobs[job_id] = {"status": "queued", "type": "mirror", "pct": 0, "current": None, "logs": ["Queued for execution..."]}
+    st.cancel_evts[job_id] = asyncio.Event()
+    asyncio.create_task(_run_mirror(job_id, body.source_id, body.target_id, body.limit))
+    return {"job_id": job_id}
+
+
+@app.get("/api/mirrors")
+async def get_mirrors():
+    return await _db_run(_db_get_mirrors)
+
+
+@app.post("/api/mirror/sync/start")
+async def start_sync(body: MirrorReq):
+    c = await _client()
+    # Resolve IDs to integers for the sync_map
+    src = await _get_entity_robust(c, body.source_id)
+    dst = await _get_entity_robust(c, body.target_id)
+    sid, tid = src.id, dst.id
+    # Marked IDs are better for internal comparison
+    from telethon import utils
+    sid, tid = utils.get_peer_id(src), utils.get_peer_id(dst)
+
+    if sid not in st.sync_map: st.sync_map[sid] = set()
+    st.sync_map[sid].add(tid)
+    await _db_run(lambda: _db_add_sync_rule(sid, tid))
+    return {"status": "ok", "source": sid, "target": tid}
+
+
+@app.post("/api/mirror/sync/stop")
+async def stop_sync(body: MirrorReq):
+    c = await _client()
+    src = await _get_entity_robust(c, body.source_id)
+    dst = await _get_entity_robust(c, body.target_id)
+    from telethon import utils
+    sid, tid = utils.get_peer_id(src), utils.get_peer_id(dst)
+
+    if sid in st.sync_map:
+        st.sync_map[sid].discard(tid)
+        if not st.sync_map[sid]: del st.sync_map[sid]
+    await _db_run(lambda: _db_remove_sync_rule(sid, tid))
+    return {"status": "ok"}
+
+
+@app.get("/api/mirror/sync/list")
+async def list_syncs():
+    return [{"source_id": k, "targets": list(v)} for k, v in st.sync_map.items()]
 
 
 # ── Gallery data API ─────────────────────────────────────────────────────────

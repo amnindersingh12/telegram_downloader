@@ -57,7 +57,7 @@ if (document.body.classList.contains('idx-page')) {
           thumbObs.unobserve(e.target);
         }
       });
-    }, { rootMargin: '1000px' });
+    }, { rootMargin: '2500px' });
 
     // ── View switcher ───────────────────────────────────────────────────────
     window.sv = v => {
@@ -118,6 +118,8 @@ if (document.body.classList.contains('idx-page')) {
     function initApp() {
       allChs = []; selChs.clear(); items.clear(); selItems.clear(); updSelCount();
       folders = []; activeFolder = '';
+      loadMirrors();
+      loadSyncRules();
       document.getElementById('chlist').innerHTML =
         '<div style="padding:8px;display:grid;gap:6px">' +
         '<div class="sk" style="height:56px"></div>'.repeat(5) + '</div>';
@@ -172,6 +174,7 @@ if (document.body.classList.contains('idx-page')) {
 
     function renderChannelList() {
       const list = document.getElementById('chlist');
+      if (!list) return;
       list.innerHTML = '';
       const searchQ = (document.querySelector('#sp-channels .sw input')?.value || '').toLowerCase();
       let filtered = allChs;
@@ -186,6 +189,25 @@ if (document.body.classList.contains('idx-page')) {
         return;
       }
       filtered.forEach(ch => appendCh(ch, list));
+      updMirDatalist();
+    }
+
+    function updMirDatalist() {
+      const dlAll = document.getElementById('ch-datalist-all');
+      const dlTarget = document.getElementById('ch-datalist-target');
+      if (!dlAll || !dlTarget) return;
+
+      const items = allChs.map(ch =>
+        `<option value="${ch.id}">${esc(ch.title)} (${ch.type}${ch.username ? ', @' + ch.username : ''})</option>`
+      );
+      dlAll.innerHTML = items.join('');
+
+      const targetItems = allChs
+        .filter(ch => ch.can_post)
+        .map(ch =>
+          `<option value="${ch.id}">${esc(ch.title)} (Your ${ch.type})</option>`
+        );
+      dlTarget.innerHTML = targetItems.join('');
     }
 
     function appendCh(ch, list) {
@@ -926,6 +948,139 @@ if (document.body.classList.contains('idx-page')) {
       } catch (e) { toast(e.message, 'err'); }
     };
 
+    window.doMirror = async () => {
+      const srcRaw = document.getElementById('mir-src').value.trim();
+      const dst = document.getElementById('mir-dst').value.trim();
+      const lim = +document.getElementById('mir-lim').value || null;
+      if (!srcRaw || !dst) return toast('Enter both source and target', 'err');
+      
+      const sources = srcRaw.split(',').map(s => s.trim()).filter(Boolean);
+      const isSync = document.getElementById('mir-sync').checked;
+      
+      for (const src of sources) {
+        try {
+          const { job_id } = await api('/api/mirror/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_id: src, target_id: dst, limit: lim })
+          });
+          addMirrorCard(job_id, src, dst);
+          
+          if (isSync) {
+            await api('/api/mirror/sync/start', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ source_id: src, target_id: dst })
+            });
+            toast(`Live Sync enabled for ${src}`, 'ok');
+            loadSyncRules();
+          }
+          const es = new EventSource(`/api/download/${job_id}/progress`);
+          es.onmessage = e => {
+            const d = JSON.parse(e.data);
+            updateMirrorCard(job_id, d);
+            if (d.status === 'done' || d.status === 'cancelled' || d.status === 'error') es.close();
+          };
+          es.onerror = () => es.close();
+        } catch (e) { toast(`${src}: ${e.message}`, 'err'); }
+      }
+    };
+
+    function addMirrorCard(id, src, dst, status='Queued…', current='', logs=[]) {
+      const hist = document.getElementById('mir-history');
+      if (document.getElementById(`job-${id}`)) return;
+      const card = document.createElement('div');
+      card.className = 'ext-item'; card.id = `job-${id}`;
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:start">
+          <div class="ext-url">👯 ${esc(src)} → ${esc(dst)}</div>
+          <button class="vbtn" style="padding:2px 6px;font-size:9px" onclick="toggleLogs('${id}')">Logs</button>
+        </div>
+        <div id="st-${id}" style="color:var(--muted);font-size:11px">${status}</div>
+        <div class="ext-prog"><div class="ext-pbar" id="pb-${id}"></div></div>
+        <div id="logs-${id}" class="m-logs" style="display:none"></div>
+        <button class="pcancel" style="margin-top:6px" onclick="cancelJob('${id}')">Cancel</button>`;
+      hist.prepend(card);
+      if (logs.length) updateMirrorLogs(id, logs);
+    }
+
+    function updateMirrorCard(id, d) {
+      const pb = document.getElementById(`pb-${id}`);
+      if (pb) pb.style.width = (d.pct || 0) + '%';
+      const st = document.getElementById(`st-${id}`);
+      if (!st) return;
+      if (d.status === 'done') {
+        st.textContent = '✅ Sync Complete';
+        st.style.color = '#35d47b';
+        document.querySelector(`#job-${id} .pcancel`)?.remove();
+      } else if (d.status === 'error') {
+        st.textContent = '❌ Error: ' + (d.current || 'Unknown');
+        st.style.color = '#ff6b8a';
+      } else if (d.status === 'cancelled') {
+        st.textContent = '🚫 Cancelled';
+      } else {
+        st.textContent = `Cloned ${d.done || 0}/${d.total || '?'}` + (d.current ? ` (${d.current})` : '');
+      }
+      if (d.logs) updateMirrorLogs(id, d.logs);
+    }
+
+    function updateMirrorLogs(id, logs) {
+      const box = document.getElementById(`logs-${id}`);
+      if (!box) return;
+      box.innerHTML = logs.map(l => `<div>${esc(l)}</div>`).join('');
+    }
+
+    window.toggleLogs = (id) => {
+      const box = document.getElementById(`logs-${id}`);
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+    };
+
+    async function loadMirrors() {
+      try {
+        const mirrors = await api('/api/mirrors');
+        mirrors.forEach(m => {
+          addMirrorCard(m.id, m.source_id, m.target_id, m.status);
+          const st = document.getElementById(`st-${m.id}`);
+          if (m.status === 'done') {
+            st.textContent = '✅ Completed';
+            st.style.color = '#35d47b';
+            document.querySelector(`#job-${m.id} .pcancel`)?.remove();
+          }
+          document.getElementById(`pb-${m.id}`).style.width = '100%';
+        });
+      } catch (e) { console.error('Failed to load mirrors', e); }
+    }
+
+    async function loadSyncRules() {
+      const box = document.getElementById('mir-syncs');
+      if (!box) return;
+      try {
+        const rules = await api('/api/mirror/sync/list');
+        if (!rules.length) { box.innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>'; return; }
+        
+        box.innerHTML = rules.map(r => r.targets.map(t => `
+          <div class="ext-item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-left:2px solid var(--ok)">
+            <div style="font-size:11px">
+              <span class="sb-dot" style="display:inline-block;margin-right:6px"></span>
+              <b>${r.source_id}</b> → <b>${t}</b>
+            </div>
+            <button class="vbtn" style="width:auto;padding:2px 8px;font-size:10px;background:var(--err)" onclick="stopSync('${r.source_id}', '${t}')">Stop</button>
+          </div>`).join('')).join('');
+      } catch (e) { console.error('Sync Rules load failed', e); }
+    }
+
+    window.stopSync = async (src, dst) => {
+      try {
+        await api('/api/mirror/sync/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source_id: src, target_id: dst })
+        });
+        toast('Sync stopped', 'ok');
+        loadSyncRules();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+
     // ── Keyboard shortcuts ────────────────────────────────────────────────────
     document.addEventListener('keydown', e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
@@ -949,6 +1104,33 @@ if (document.body.classList.contains('idx-page')) {
     // ── Error helpers ─────────────────────────────────────────────────────────
     function showErr(id, m) { const el = document.getElementById(id); el.textContent = m; el.style.display = 'block'; }
     function hideErr(id) { document.getElementById(id).style.display = 'none'; }
+
+    // ── Resizers ─────────────────────────────────────────────────────────────
+    (function() {
+      const g = document.getElementById('gutter');
+      const s = document.querySelector('.sidebar');
+      if (!g || !s) return;
+      let dragging = false;
+      g.addEventListener('mousedown', e => { 
+        e.preventDefault();
+        dragging = true; 
+        g.classList.add('active'); 
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+      });
+      window.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        const w = Math.min(Math.max(240, e.clientX), 700);
+        s.style.width = w + 'px';
+      });
+      window.addEventListener('mouseup', () => { 
+        if (!dragging) return;
+        dragging = false; 
+        g.classList.remove('active'); 
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      });
+    })();
 
     // ── Boot ──────────────────────────────────────────────────────────────────
     (async () => {
