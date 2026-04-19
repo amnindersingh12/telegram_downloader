@@ -112,29 +112,84 @@ if (document.body.classList.contains('idx-page')) {
     };
 
     // ── App init ────────────────────────────────────────────────────────────
+    let folders = [];        // [{name, emoji}]
+    let activeFolder = '';   // '' = All
+
     function initApp() {
       allChs = []; selChs.clear(); items.clear(); selItems.clear(); updSelCount();
+      folders = []; activeFolder = '';
       document.getElementById('chlist').innerHTML =
         '<div style="padding:8px;display:grid;gap:6px">' +
         '<div class="sk" style="height:56px"></div>'.repeat(5) + '</div>';
+      renderFolderTabs();
       const es = new EventSource('/api/channels');
+      let chRenderPending = false;
       es.onmessage = e => {
-        const ch = JSON.parse(e.data);
-        if (ch.done) { es.close(); return; }
-        allChs.push(ch);
-        appendCh(ch);
+        const d = JSON.parse(e.data);
+        if (d.folder_list) {
+          folders = d.folder_list;
+          renderFolderTabs();
+          return;
+        }
+        if (d.done) { es.close(); renderChannelList(); return; }
+        allChs.push(d);
+        if (!chRenderPending) {
+          chRenderPending = true;
+          requestAnimationFrame(() => { chRenderPending = false; renderChannelList(); });
+        }
       };
       es.onerror = () => es.close();
       updViewport();
     }
+
+    function renderFolderTabs() {
+      let el = document.getElementById('folder-tabs');
+      if (!el) {
+        const parent = document.getElementById('sp-channels');
+        const ss = parent.querySelector('.ss');
+        el = document.createElement('div');
+        el.id = 'folder-tabs';
+        el.className = 'ftabs';
+        parent.insertBefore(el, ss);
+      }
+      const tabs = [{name: '', emoji: '', label: 'All'}];
+      folders.forEach(f => tabs.push({...f, label: (f.emoji ? f.emoji + ' ' : '') + f.name}));
+      el.innerHTML = tabs.map(t =>
+        `<button class="ftab${t.name === activeFolder ? ' active' : ''}" onclick="setFolder('${esc(t.name)}')">${esc(t.label)}</button>`
+      ).join('');
+    }
+
+    window.setFolder = name => {
+      activeFolder = name;
+      renderFolderTabs();
+      renderChannelList();
+    };
 
     // ── Channel list ────────────────────────────────────────────────────────
     function chColor(t) {
       return COLORS[Math.abs([...t].reduce((a, c) => a + c.charCodeAt(0), 0)) % COLORS.length];
     }
 
-    function appendCh(ch) {
+    function renderChannelList() {
       const list = document.getElementById('chlist');
+      list.innerHTML = '';
+      const searchQ = (document.querySelector('#sp-channels .sw input')?.value || '').toLowerCase();
+      let filtered = allChs;
+      if (activeFolder) {
+        filtered = filtered.filter(c => c.folders && c.folders.includes(activeFolder));
+      }
+      if (searchQ) {
+        filtered = filtered.filter(c => c.title.toLowerCase().includes(searchQ));
+      }
+      if (!filtered.length) {
+        list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No channels</div>';
+        return;
+      }
+      filtered.forEach(ch => appendCh(ch, list));
+    }
+
+    function appendCh(ch, list) {
+      if (!list) list = document.getElementById('chlist');
       if (list.querySelector('.sk')) list.innerHTML = '';
       const color = chColor(ch.title);
       const sel = selChs.has(ch.id);
@@ -145,9 +200,11 @@ if (document.body.classList.contains('idx-page')) {
       const mem = ch.members
         ? `${ch.members > 999 ? (ch.members / 1000).toFixed(1) + 'k' : ch.members} members`
         : ch.type;
+      const folderBadge = ch.folders?.length
+        ? `<span class="ch-folder">${esc(ch.folders[0])}</span>` : '';
       div.innerHTML = `
         <div class="av" style="background:${color}20;color:${color}">${ch.title.charAt(0).toUpperCase()}</div>
-        <div class="ci"><div class="cn">${esc(ch.title)}</div><div class="cm">${mem}</div></div>
+        <div class="ci"><div class="cn">${esc(ch.title)}</div><div class="cm">${mem} ${folderBadge}</div></div>
         <div class="ck">${sel ? chk() : ''}</div>`;
       list.appendChild(div);
     }
@@ -157,6 +214,7 @@ if (document.body.classList.contains('idx-page')) {
       else { selChs.add(id); el.classList.add('sel'); el.querySelector('.ck').innerHTML = chk(); }
       const btn = document.getElementById('vmbtn');
       btn.textContent = `${selChs.size} selected`;
+      updSelAllBtn();
       // Auto-load immediately on selection change
       if (selChs.size > 0) loadMedia();
       else {
@@ -167,6 +225,42 @@ if (document.body.classList.contains('idx-page')) {
         document.getElementById('empty').style.display = 'flex';
         updPillCounts();
       }
+    }
+
+    window.selAllChs = () => {
+      let visible = allChs;
+      if (activeFolder) {
+        visible = visible.filter(c => c.folders && c.folders.includes(activeFolder));
+      }
+      const visibleIds = visible.map(c => c.id);
+      const allSelected = visibleIds.length > 0 && visibleIds.every(id => selChs.has(id));
+
+      if (allSelected) {
+        visibleIds.forEach(id => selChs.delete(id));
+      } else {
+        visibleIds.forEach(id => selChs.add(id));
+      }
+
+      document.getElementById('vmbtn').textContent = `${selChs.size} selected`;
+      updSelAllBtn();
+      renderChannelList();
+      if (selChs.size > 0) loadMedia();
+      else {
+        items.clear(); selItems.clear(); allMediaKeys = [];
+        const grid = document.getElementById('mgrid');
+        grid.innerHTML = ''; grid.style.display = 'none';
+        document.getElementById('empty').style.display = 'flex';
+        updPillCounts();
+      }
+    };
+
+    function updSelAllBtn() {
+      const btn = document.getElementById('selall-ch');
+      if (!btn) return;
+      let visible = allChs;
+      if (activeFolder) visible = visible.filter(c => c.folders && c.folders.includes(activeFolder));
+      const allSel = visible.length > 0 && visible.every(c => selChs.has(c.id));
+      btn.textContent = allSel ? 'Deselect All' : 'Select All';
     }
 
     function updPillCounts() {
@@ -185,9 +279,7 @@ if (document.body.classList.contains('idx-page')) {
     }
 
     window.filterChs = q => {
-      const lo = q.toLowerCase();
-      document.getElementById('chlist').innerHTML = '';
-      (q ? allChs.filter(c => c.title.toLowerCase().includes(lo)) : allChs).forEach(appendCh);
+      renderChannelList();
     };
 
     window.switchSTab = (name, el) => {
@@ -205,6 +297,7 @@ if (document.body.classList.contains('idx-page')) {
     let currentSort = '';
     let viewportHeight = 0;
     let columns = 1;
+    let vsRAF = null;
 
     function updViewport() {
       const grid = document.getElementById('mgrid');
@@ -217,39 +310,53 @@ if (document.body.classList.contains('idx-page')) {
 
     function renderVirtual() {
       const grid = document.getElementById('mgrid');
-      if (!grid || !filteredKeys.length) {
-        if (grid) { grid.innerHTML = ''; grid.style.paddingTop = '0'; grid.style.paddingBottom = '0'; }
+      if (!grid) return;
+
+      if (!filteredKeys.length) {
+        grid.innerHTML = '';
+        grid.style.height = '';
         return;
       }
 
-      const st = grid.scrollTop;
+      // Recalc viewport if needed (first render)
+      if (!viewportHeight) {
+        viewportHeight = grid.clientHeight || 600;
+        const cardW = (viewMode === 'gallery') ? 250 : 152;
+        columns = Math.floor((grid.clientWidth - 12) / (cardW + 8)) || 1;
+      }
+
+      const gap = 8;
       const rowH = (viewMode === 'gallery') ? 258 : 160;
-      const startRow = Math.max(0, Math.floor(st / rowH) - 1);
-      const endRow = Math.min(Math.ceil((st + viewportHeight) / rowH) + 1, Math.ceil(filteredKeys.length / columns));
+      const totalRows = Math.ceil(filteredKeys.length / columns);
+      const totalH = totalRows * rowH;
+
+      // Set grid to full scroll height
+      grid.style.height = totalH + 'px';
+      grid.style.position = 'relative';
+
+      const st = grid.scrollTop;
+      const buffer = 3; // extra rows above/below
+      const startRow = Math.max(0, Math.floor(st / rowH) - buffer);
+      const endRow = Math.min(totalRows, Math.ceil((st + viewportHeight) / rowH) + buffer);
 
       const startIdx = startRow * columns;
-      const endIdx = endRow * columns;
+      const endIdx = Math.min(endRow * columns, filteredKeys.length);
       const visibleKeys = filteredKeys.slice(startIdx, endIdx);
       const visibleSet = new Set(visibleKeys);
 
-      // Update padding
-      grid.style.paddingTop = (startRow * rowH) + 'px';
-      grid.style.paddingBottom = (Math.max(0, Math.ceil(filteredKeys.length / columns) - endRow) * rowH) + 'px';
-
-      // 1. Remove cards that are no longer visible
-      const children = Array.from(grid.children);
-      children.forEach(child => {
-        const key = child.dataset.key;
-        if (!visibleSet.has(key)) {
+      // Remove out-of-view cards
+      for (const child of Array.from(grid.children)) {
+        if (!visibleSet.has(child.dataset.key)) {
           grid.removeChild(child);
         }
-      });
+      }
 
-      // 2. Add or Move cards to maintain order
+      // Track existing
       const existing = new Map();
-      Array.from(grid.children).forEach(c => existing.set(c.dataset.key, c));
+      for (const c of grid.children) existing.set(c.dataset.key, c);
 
-      visibleKeys.forEach((key, idx) => {
+      // Add/position visible cards
+      visibleKeys.forEach((key, i) => {
         const item = items.get(key);
         if (!item) return;
 
@@ -258,14 +365,28 @@ if (document.body.classList.contains('idx-page')) {
           el = makeCard(key, item);
           thumbObs.observe(el);
           el.dataset.obs = '1';
+          grid.appendChild(el);
         }
-        grid.appendChild(el);
+
+        // Position via CSS grid — use transform for GPU acceleration
+        const globalIdx = startIdx + i;
+        const row = Math.floor(globalIdx / columns);
+        const col = globalIdx % columns;
+        el.style.position = 'absolute';
+        el.style.width = `calc((100% - ${(columns - 1) * gap}px) / ${columns})`;
+        el.style.height = (rowH - gap) + 'px';
+        el.style.left = `calc(${col} * (100% - ${(columns - 1) * gap}px) / ${columns} + ${col * gap}px)`;
+        el.style.top = (row * rowH) + 'px';
       });
     }
 
-    window.addEventListener('scroll', e => {
-      if (e.target.id === 'mgrid') renderVirtual();
-    }, true);
+    const mgrid = document.getElementById('mgrid');
+    if (mgrid) {
+      mgrid.addEventListener('scroll', () => {
+        if (vsRAF) return;
+        vsRAF = requestAnimationFrame(() => { vsRAF = null; renderVirtual(); });
+      }, { passive: true });
+    }
 
     window.addEventListener('resize', updViewport);
 
@@ -290,9 +411,30 @@ if (document.body.classList.contains('idx-page')) {
         });
       }
 
-      // Search Filter
+      // Search Filter — fuzzy across filename, caption, date
       if (currentSearch) {
-        keys = keys.filter(k => items.get(k).filename.toLowerCase().includes(currentSearch));
+        const words = currentSearch.split(/\s+/).filter(Boolean);
+        const scored = [];
+        for (const k of keys) {
+          const it = items.get(k);
+          if (!it) continue;
+          const hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
+          // Every word must appear somewhere
+          if (!words.every(w => hay.includes(w))) continue;
+          // Score: exact filename match > filename starts-with > filename contains > caption match
+          let score = 0;
+          const fn = (it.filename || '').toLowerCase();
+          const cap = (it.caption || '').toLowerCase();
+          for (const w of words) {
+            if (fn === w) score += 100;
+            else if (fn.startsWith(w)) score += 50;
+            else if (fn.includes(w)) score += 20;
+            else if (cap.includes(w)) score += 5;
+          }
+          scored.push({ k, score });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        keys = scored.map(s => s.k);
       }
 
       // Sort
@@ -421,30 +563,55 @@ if (document.body.classList.contains('idx-page')) {
       // Not used in virtual mode, kept for legacy if needed
     }
 
-    async function loadThumb(cardEl, item) {
-      if (!item || item.type === 'document') return;
-      try {
-        const r = await fetch(`/api/thumb/${item.channel_id}/${item.msg_id}`);
-        if (!r.ok) return;
-        const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        cardEl.style.setProperty('--bg-img', `url(${url})`);
+    // Thumbnail loading with concurrency throttle
+    const THUMB_CONCURRENCY = 8;
+    let thumbActive = 0;
+    const thumbQueue = [];
+
+    function drainThumbQueue() {
+      while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
+        const job = thumbQueue.shift();
+        thumbActive++;
+        job().finally(() => { thumbActive--; drainThumbQueue(); });
+      }
+    }
+
+    function loadThumb(cardEl, item) {
+      if (!item) return;
+      const url = `/api/thumb/${item.channel_id}/${item.msg_id}`;
+
+      thumbQueue.push(() => new Promise(resolve => {
         const nth = cardEl.querySelector('.nth');
-        if (!nth) return;
-        if (item.type === 'photo') {
-          const img = document.createElement('img'); img.src = url; nth.replaceWith(img);
-        } else {
+        if (!nth) { resolve(); return; }
+
+        if (item.type === 'video') {
+          // Video: set poster from thumb, lazy-load full video on hover
           const vid = document.createElement('video');
-          vid.poster = url; vid.muted = true; vid.loop = true; vid.setAttribute('playsinline', '');
+          vid.poster = url; vid.muted = true; vid.loop = true;
+          vid.setAttribute('playsinline', '');
           vid.className = 'card-vid';
           nth.replaceWith(vid);
+          cardEl.style.setProperty('--bg-img', `url(${url})`);
           cardEl.onmouseenter = () => {
             if (!vid.src) { vid.src = `/api/preview/${item.channel_id}/${item.msg_id}`; vid.load(); }
-            vid.play().catch(() => { });
+            vid.play().catch(() => {});
           };
           cardEl.onmouseleave = () => vid.pause();
+          resolve();
+          return;
         }
-      } catch { }
+
+        // Photo/doc: load thumbnail image
+        const img = new Image();
+        img.onload = () => {
+          cardEl.style.setProperty('--bg-img', `url(${url})`);
+          nth.replaceWith(img);
+          resolve();
+        };
+        img.onerror = () => resolve();
+        img.src = url;
+      }));
+      drainThumbQueue();
     }
 
     function toggleSel(key, el) {
@@ -480,192 +647,6 @@ if (document.body.classList.contains('idx-page')) {
     };
     
     
-    
-    // ── Native Lightbox — improved strip model ─────────────────────
-    let lbIdx = 0;
-    let lbStripping = false;
-
-    const lb = document.getElementById('lb');
-    const lbTrack = document.getElementById('lb-content');
-    const lbInfo = document.getElementById('lb-info');
-
-    // Setup track
-    lbTrack.innerHTML = '';
-    lbTrack.style.cssText = `
-      display: flex;
-      width: 300%;
-      height: 100%;
-      will-change: transform;
-      transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
-      transform: translateX(-33.333%);`;
-
-    const panels = [0, 1, 2].map(() => {
-      const p = document.createElement('div');
-      p.className = 'lb-panel';
-      lbTrack.appendChild(p);
-      return p;
-    });
-
-    // 🔥 PRELOAD (CRITICAL)
-    function preload(idx) {
-      const key = filteredKeys[idx];
-      if (!key) return;
-      const item = items.get(key);
-      if (!item || item.type === 'video') return;
-
-      const img = new Image();
-      img.src = `/api/preview/${item.channel_id}/${item.msg_id}`;
-    }
-
-    // Fill panel
-    async function _lbFillPanel(panel, idx) {
-      panel.innerHTML = '';
-      const key = filteredKeys[idx];
-      if (!key) return;
-
-      const item = items.get(key);
-      if (!item) return;
-
-      const url = `/api/preview/${item.channel_id}/${item.msg_id}`;
-
-      if (item.type === 'video') {
-        const v = document.createElement('video');
-        v.src = url;
-        v.controls = true;
-        v.playsInline = true;
-        v.className = 'lb-media';
-        panel.appendChild(v);
-        return v;
-      }
-
-      return new Promise(res => {
-        const img = new Image();
-        img.className = 'lb-media';
-        img.onload = () => {
-          panel.appendChild(img);
-          res(img);
-        };
-        img.onerror = () => {
-          panel.innerHTML = '<div style="color:rgba(255,255,255,.4)">Preview not available</div>';
-          res();
-        };
-        img.src = url;
-      });
-    }
-
-    function _lbUpdateInfo() {
-      const item = items.get(filteredKeys[lbIdx]);
-      if (!item) return;
-      lbInfo.textContent = `${item.filename} · ${item.size_readable || hrSize(item.size)} · ${lbIdx + 1} / ${filteredKeys.length}`;
-    }
-
-    // Init
-    async function _lbInitStrip(idx) {
-      lbTrack.style.transition = 'none';
-      lbTrack.style.transform = 'translateX(-33.333%)';
-
-      panels.forEach(p => p.innerHTML = '<div class="lb-spinner"></div>');
-
-      await Promise.all([
-        _lbFillPanel(panels[0], idx - 1),
-        _lbFillPanel(panels[1], idx),
-        _lbFillPanel(panels[2], idx + 1),
-      ]);
-
-      panels[1].classList.add('active');
-
-      // 🔥 preload neighbors
-      preload(idx + 2);
-      preload(idx - 2);
-
-      panels[1].querySelector('video')?.play().catch(() => { });
-    }
-
-    function lbOpen(key) {
-      lbIdx = filteredKeys.indexOf(key);
-      if (lbIdx === -1) return;
-
-      lb.classList.add('open');
-      document.body.style.overflow = 'hidden';
-
-      _lbInitStrip(lbIdx);
-      _lbUpdateInfo();
-    }
-
-    function lbClose() {
-      lb.classList.remove('open');
-      document.body.style.overflow = '';
-
-      lbTrack.querySelectorAll('video').forEach(v => {
-        v.pause();
-        v.src = '';
-      });
-    }
-
-    // 🚀 SMOOTH NAVIGATION
-    function lbNav(dir) {
-      if (lbStripping) return;
-
-      const next = lbIdx + dir;
-      if (next < 0 || next >= filteredKeys.length) return;
-
-      lbStripping = true;
-
-      const current = panels[1];
-      const target = dir > 0 ? panels[2] : panels[0];
-
-      // 🔥 CROSSFADE (important)
-      current.classList.remove('active');
-      current.classList.add('prev');
-      target.classList.add('active');
-
-      current.querySelector('video')?.pause();
-
-      // 🔥 preload ahead BEFORE move
-      preload(next + 1);
-      preload(next - 1);
-
-      lbTrack.style.transition = 'transform 0.5s cubic-bezier(0.22, 1, 0.36, 1)';
-      lbTrack.style.transform =
-        dir > 0 ? 'translateX(-66.666%)' : 'translateX(0%)';
-
-      lbTrack.addEventListener('transitionend', async function onDone() {
-        lbTrack.removeEventListener('transitionend', onDone);
-
-        lbIdx = next;
-        _lbUpdateInfo();
-
-        // 🔥 Rotate panels WITHOUT visual jump
-        lbTrack.style.transition = 'none';
-
-        if (dir > 0) {
-          lbTrack.appendChild(lbTrack.firstElementChild);
-        } else {
-          lbTrack.prepend(lbTrack.lastElementChild);
-        }
-
-        // Refresh panel refs
-        for (let i = 0; i < 3; i++) panels[i] = lbTrack.children[i];
-
-        // Reset states
-        panels.forEach(p => p.classList.remove('active', 'prev'));
-        panels[1].classList.add('active');
-
-        // Recenter
-        lbTrack.style.transform = 'translateX(-33.333%)';
-
-        // Fill edge
-        const edgeIdx = dir > 0 ? lbIdx + 1 : lbIdx - 1;
-        const edgePanel = dir > 0 ? panels[2] : panels[0];
-
-        edgePanel.innerHTML = '<div class="lb-spinner"></div>';
-        await _lbFillPanel(edgePanel, edgeIdx);
-
-        panels[1].querySelector('video')?.play().catch(() => { });
-
-        lbStripping = false;
-      }, { once: true });
-    }
     // ── Native Lightbox ─────────────────────────────────────────────────────
     let lbIdx = 0;
     let lbActiveMedia = null;
@@ -921,7 +902,7 @@ if (document.body.classList.contains('idx-page')) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { if (selItems.size) doDl(); }
     });
 
-    document.getElementById('msearch')?.addEventListener('input', debounce(e => searchMedia(e.target.value), 300));
+    document.getElementById('msearch')?.addEventListener('input', debounce(e => searchMedia(e.target.value), 80));
 
     // ── Error helpers ─────────────────────────────────────────────────────────
     function showErr(id, m) { const el = document.getElementById(id); el.textContent = m; el.style.display = 'block'; }

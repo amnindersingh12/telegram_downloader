@@ -72,15 +72,21 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     if CREDS_FILE.exists() and SESSION.with_suffix(".session").exists():
         try:
             creds = json.loads(CREDS_FILE.read_text())
-            st.api_id, st.api_hash = creds["api_id"], creds["api_hash"]
+            st.api_id   = creds["api_id"]
+            st.api_hash = creds["api_hash"]
             st.client = _mk_client(st.api_id, st.api_hash)
             await st.client.connect()
             if not await st.client.is_user_authorized():
+                # Session file exists but is expired — clear it
+                logger.warning("Saved session is not authorized — clearing")
                 await st.client.disconnect()
                 st.client = None
+                SESSION.with_suffix(".session").unlink(missing_ok=True)
+            else:
+                logger.info("Restored Telegram session from disk")
         except Exception:
-            logger.error("Failed to restore Telegram session", exc_info=True)
-            st.client = None
+            # Transient network error: keep the client so _client() can reconnect
+            logger.warning("Could not verify session on startup (network?); will retry on first request", exc_info=True)
     yield
     # Graceful shutdown: cancel all active downloads
     for evt in st.cancel_evts.values():
@@ -108,8 +114,14 @@ class AuthVerify(BaseModel):
 
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
-    authed = bool(st.client and st.client.is_connected()
-                  and await st.client.is_user_authorized())
+    if not st.client:
+        return {"authenticated": False, "phone": st.phone}
+    try:
+        if not st.client.is_connected():
+            await st.client.connect()
+        authed = await st.client.is_user_authorized()
+    except Exception:
+        authed = False
     return {"authenticated": authed, "phone": st.phone}
 
 
@@ -128,7 +140,7 @@ async def auth_init(body: AuthInit) -> dict[str, Any]:
     st.client = _mk_client(body.api_id, body.api_hash)
     await st.client.connect()
     if await st.client.is_user_authorized():
-        CREDS_FILE.write_text(json.dumps({"api_id": body.api_id, "api_hash": body.api_hash}))
+        CREDS_FILE.write_text(json.dumps({"api_id": body.api_id, "api_hash": body.api_hash, "phone": body.phone}))
         return {"success": True, "already_authorized": True}
     try:
         result = await st.client.send_code_request(body.phone)
@@ -136,12 +148,18 @@ async def auth_init(body: AuthInit) -> dict[str, Any]:
         return {"success": True, "needs_otp": True}
     except errors.PhoneNumberInvalidError:
         raise HTTPException(400, "Invalid phone number. Include country code e.g. +919876543210")
+    except errors.FloodWaitError as e:
+        raise HTTPException(429, f"Too many attempts — wait {e.seconds}s before retrying")
+    except errors.AuthRestartError:
+        raise HTTPException(500, "Telegram auth restarted — please try again")
+    except Exception as e:
+        raise HTTPException(500, f"Telegram error: {e}")
 
 
 @app.post("/api/auth/verify")
 async def auth_verify(body: AuthVerify) -> dict[str, Any]:
     if not st.client:
-        raise HTTPException(400, "Start auth first")
+        raise HTTPException(400, "Start auth first — go back and re-enter credentials")
     try:
         await st.client.sign_in(st.phone, body.code, phone_code_hash=st.phone_hash)
     except errors.SessionPasswordNeededError:
@@ -149,8 +167,15 @@ async def auth_verify(body: AuthVerify) -> dict[str, Any]:
             return {"success": False, "needs_2fa": True}
         await st.client.sign_in(password=body.password)
     except errors.PhoneCodeInvalidError:
-        raise HTTPException(400, "Invalid OTP code")
-    CREDS_FILE.write_text(json.dumps({"api_id": st.api_id, "api_hash": st.api_hash}))
+        raise HTTPException(400, "Invalid OTP code — double-check the code from Telegram")
+    except errors.PhoneCodeExpiredError:
+        raise HTTPException(400, "OTP expired — go back and request a new code")
+    except errors.FloodWaitError as e:
+        raise HTTPException(429, f"Too many attempts — wait {e.seconds}s")
+    except Exception as e:
+        raise HTTPException(500, f"Telegram error: {e}")
+    # Save full creds including phone for session restore on next startup
+    CREDS_FILE.write_text(json.dumps({"api_id": st.api_id, "api_hash": st.api_hash, "phone": st.phone}))
     return {"success": True}
 
 
@@ -173,6 +198,33 @@ async def auth_logout() -> dict[str, Any]:
 async def stream_channels(request: Request):
     async def gen() -> AsyncGenerator[str, None]:
         c = await _client()
+
+        # Fetch Telegram folder filters → build channel_id→folder_name mapping
+        folder_map: dict[int, list[str]] = {}  # channel_id → [folder_names]
+        folder_names: list[dict] = []
+        try:
+            from telethon.tl.functions.messages import GetDialogFiltersRequest
+            result = await c(GetDialogFiltersRequest())
+            filters = getattr(result, 'filters', result) if not isinstance(result, list) else result
+            for f in filters:
+                title = getattr(f, 'title', None)
+                if not title:
+                    continue
+                # Handle both string titles and TextWithEntities
+                if hasattr(title, 'text'):
+                    title = title.text
+                title = str(title)
+                folder_names.append({"name": title, "emoji": getattr(f, 'emoticon', '') or ''})
+                for peer in getattr(f, 'include_peers', []):
+                    cid = getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
+                    if cid:
+                        folder_map.setdefault(cid, []).append(title)
+        except Exception:
+            logger.debug("Could not fetch dialog filters", exc_info=True)
+
+        # Emit folders list first
+        yield f"data: {json.dumps({'folder_list': folder_names})}\n\n"
+
         async for d in c.iter_dialogs(limit=None):
             if await request.is_disconnected():
                 break
@@ -185,6 +237,7 @@ async def stream_channels(request: Request):
                 "type": "channel" if isinstance(e, types.Channel) else "group",
                 "members": getattr(e, "participants_count", None),
                 "username": getattr(e, "username", None),
+                "folders": folder_map.get(e.id, []),
             }
             await _db_run(lambda c=ch: _db_upsert_channel(c))
             yield f"data: {json.dumps(ch)}\n\n"
@@ -219,26 +272,70 @@ async def get_thumb(channel_id: int, msg_id: int):
     # 1. RAM (O(1))
     data = st.thumbs.get(key)
     if data: return Response(data, media_type="image/jpeg", 
-                            headers={"Cache-Control": "public, max-age=86400"})
+                            headers={"Cache-Control": "public, max-age=604800"})
     
     # 2. Disk (Persistent)
     if t_path.exists():
         data = t_path.read_bytes()
         st.thumbs.set(key, data)
         return Response(data, media_type="image/jpeg", 
-                        headers={"Cache-Control": "public, max-age=86400"})
+                        headers={"Cache-Control": "public, max-age=604800"})
         
-    # 3. Telegram (Network)
+    # 3. Telegram — try stripped thumb first (no download, instant)
     try:
         c = await _client()
         entity = await c.get_entity(channel_id)
         msg = await c.get_messages(entity, ids=msg_id)
-        data = await c.download_media(msg, bytes, thumb=-1)
-        if data:
-            st.thumbs.set(key, data)
-            t_path.write_bytes(data)
-            return Response(data, media_type="image/jpeg", 
-                            headers={"Cache-Control": "public, max-age=86400"})
+
+        # Try to extract stripped thumbnail bytes (embedded in metadata)
+        thumb_bytes = None
+        media = msg.media if msg else None
+        if media:
+            photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
+            if photo:
+                for sz in getattr(photo, 'thumbs', []) or []:
+                    if hasattr(sz, 'bytes') and sz.bytes:
+                        # PhotoStrippedSize — reconstruct JPEG
+                        raw = sz.bytes
+                        if len(raw) > 0 and raw[0] == 1:
+                            # Stripped format: needs JPEG header/footer
+                            header = bytes([
+                                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+                                0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+                                0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+                                0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
+                                0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
+                                0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
+                                0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
+                                0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
+                                0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
+                                0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
+                                0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
+                                0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
+                                0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
+                                0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                            ])
+                            footer = bytes([0xFF, 0xD9])
+                            thumb_bytes = header + raw[3:] + footer
+                        else:
+                            thumb_bytes = raw
+                        break
+
+        if not thumb_bytes:
+            # Fallback: download smallest thumb
+            thumb_bytes = await c.download_media(msg, bytes, thumb=-1)
+
+        if thumb_bytes:
+            st.thumbs.set(key, thumb_bytes)
+            t_path.write_bytes(thumb_bytes)
+            return Response(thumb_bytes, media_type="image/jpeg", 
+                            headers={"Cache-Control": "public, max-age=604800"})
     except Exception:
         pass
     

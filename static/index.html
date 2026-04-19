@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>TGrab — Telegram Media Downloader</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=6">
 </head>
 
 <body class="idx-page">
@@ -92,8 +92,9 @@
               <div class="sk" style="height:56px"></div>
             </div>
           </div>
-          <div class="sf">
-            <button class="vbtn" id="vmbtn" disabled style="cursor:default;opacity:.7">0 selected</button>
+          <div class="sf" style="display:flex;gap:6px">
+            <button class="vbtn" id="vmbtn" disabled style="cursor:default;opacity:.7;flex:1">0 selected</button>
+            <button class="vbtn" id="selall-ch" onclick="selAllChs()" style="flex:0 0 auto;padding:9px 12px;background:transparent;border:1px solid var(--border);color:var(--muted)">Select All</button>
           </div>
         </div>
 
@@ -195,6 +196,6 @@
 
   <!-- Toasts -->
   <div id="toasts"></div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=7" defer></script>
 </body>
 </html>
