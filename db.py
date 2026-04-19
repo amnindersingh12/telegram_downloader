@@ -40,7 +40,8 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS mirrors (
             id TEXT PRIMARY KEY, source_id INTEGER, target_id INTEGER,
             last_msg_id INTEGER DEFAULT 0, status TEXT, 
-            total INTEGER DEFAULT 0, current INTEGER DEFAULT 0
+            total INTEGER DEFAULT 0, current INTEGER DEFAULT 0,
+            logs TEXT DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS mirrored_messages (
             source_id INTEGER, source_msg_id INTEGER, target_id INTEGER,
@@ -62,6 +63,10 @@ def _db_init() -> None:
             c.execute("ALTER TABLE media ADD COLUMN w INTEGER DEFAULT 0")
         if "h" not in cols:
             c.execute("ALTER TABLE media ADD COLUMN h INTEGER DEFAULT 0")
+        
+        m_cols = [r["name"] for r in c.execute("PRAGMA table_info(mirrors)").fetchall()]
+        if "logs" not in m_cols:
+            c.execute("ALTER TABLE mirrors ADD COLUMN logs TEXT DEFAULT '[]'")
         
         # Migration: Ensure channel IDs are marked (negative) as per Telethon standard.
         # This fixes issues with private channels where positive IDs are ambiguous.
@@ -165,11 +170,13 @@ def _db_is_downloaded(channel_id: int, msg_id: int) -> Optional[str]:
 def _db_upsert_mirror(m: dict) -> None:
     with _db_connect() as c:
         c.execute("""
-            INSERT INTO mirrors (id, source_id, target_id, last_msg_id, status, total, current)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO mirrors (id, source_id, target_id, last_msg_id, status, total, current, logs)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET 
-                status=excluded.status, total=excluded.total, current=excluded.current, last_msg_id=excluded.last_msg_id
-        """, (m["id"], m["source_id"], m["target_id"], m.get("last_msg_id", 0), m["status"], m["total"], m["current"]))
+                status=excluded.status, total=excluded.total, current=excluded.current, 
+                last_msg_id=excluded.last_msg_id, logs=excluded.logs
+        """, (m["id"], m["source_id"], m["target_id"], m.get("last_msg_id", 0), 
+              m["status"], m["total"], m["current"], json.dumps(m.get("logs", []))))
 
 def _db_get_mirrors() -> list[dict]:
     with _db_connect() as c:

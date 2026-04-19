@@ -12,7 +12,7 @@ from telethon.tl.types import (
 from config import SESSION, DOWNLOADS, THUMB_CACHE_SIZE, MAX_CONCURRENT_DOWNLOADS, JOB_TTL_SECONDS
 from db import _db_run, _db_read, _db_get_media, _db_last_msg_id, _db_cache_media, \
     _db_is_downloaded, _db_mark_downloaded, _db_cache_media_batch, _db_upsert_mirror, \
-    _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
+    _db_get_mirrors, _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
 from telethon import TelegramClient, errors, events
 
 logger = logging.getLogger("tgrab")
@@ -44,7 +44,10 @@ class _State:
     api_hash:    Optional[str]  = None
     phone:       Optional[str]  = None
     phone_hash:  Optional[str]  = None
-    jobs:        dict[str, dict] = {}
+    queues:      set[asyncio.Queue] = set() # SSE event queues
+    jobs:        dict[str, dict] = {
+        "sync_activity": {"status": "running", "type": "sync", "logs": ["Live Sync service started..."], "pct": 100}
+    }
     cancel_evts: dict[str, asyncio.Event] = {}
     sync_map:    dict[int, set[int]] = {} # source_id -> {target_ids}
     thumbs:      LRU = LRU(THUMB_CACHE_SIZE)
@@ -86,8 +89,29 @@ async def _on_new_message(event):
             
             await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
             logger.info(f"Live Sync: Cloned {src_id} -> {dst_id}")
+            # Update UI logs
+            from datetime import datetime
+            log_msg = f"{datetime.now().strftime('%H:%M:%S')} Sync: Cloned {src_id} -> {dst_id}"
+            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-100:]
         except Exception as e:
             logger.error(f"Live Sync Error: {e}")
+            from datetime import datetime
+            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} Error: {e}"])[-100:]
+        
+        # Persist sync_activity state
+        await _db_run(lambda: _db_upsert_mirror({
+            "id": "sync_activity", "source_id": 0, "target_id": 0,
+            "status": "running", "total": 0, "current": None,
+            "logs": st.jobs["sync_activity"].get("logs", [])
+        }))
+    
+    # Notify connected clients about new activity (Unread updates)
+    for q in st.queues:
+        q.put_nowait({
+            "type": "new_message",
+            "channel_id": src_id,
+            "msg_id": m.id
+        })
 
 
 def _mk_client(api_id: int, api_hash: str) -> TelegramClient:
@@ -341,15 +365,19 @@ async def _run_download(job_id: str, items: list[dict]) -> None:
     job.update({"total": len(items), "done": 0, "skipped": 0,
                 "status": "running", "files": [], "errors": []})
 
-    async def one(item: dict) -> None:
-        if cancel.is_set():
-            return
-        cid, mid = item["channel_id"], item["msg_id"]
-        fname = item.get("filename", f"{mid}.bin")
+    def log(msg):
+        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[-100:]
 
-        # Resume: skip if already downloaded and file still exists
-        existing = await _db_read(lambda: _db_is_downloaded(cid, mid))
+    async def one(item: dict) -> None:
+        if cancel.is_set(): return
+        msg_id, cid = item["msg_id"], item["channel_id"]
+        fname = item["filename"] or f"file_{msg_id}"
+        log(f"Processing: {fname}")
+        
+        # Check cache
+        existing = await _db_read(lambda: _db_is_downloaded(cid, msg_id))
         if existing and Path(existing).exists():
+            log(f"Skipped (cached): {fname}")
             job["skipped"] = job.get("skipped", 0) + 1
             job["done"] = job.get("done", 0) + 1
             return
@@ -362,50 +390,52 @@ async def _run_download(job_id: str, items: list[dict]) -> None:
                     folder.mkdir(parents=True, exist_ok=True)
                     dest = folder / fname
 
-                    # Skip if file already on disk (even if not in DB)
                     if dest.exists():
-                        await _db_run(lambda: _db_mark_downloaded(cid, mid, str(dest)))
+                        log(f"Linked existing: {fname}")
+                        await _db_run(lambda: _db_mark_downloaded(cid, msg_id, str(dest)))
                         job["skipped"] = job.get("skipped", 0) + 1
-                        break # Success (skipped)
+                        break
 
-                    msg = await c.get_messages(entity, ids=mid)
-
+                    msg = await c.get_messages(entity, ids=msg_id)
                     def _prog(recv, total_bytes):
                         job["current"] = fname
                         job["pct"] = round(recv / total_bytes * 100, 1) if total_bytes else 0
 
+                    log(f"Downloading media: {fname}")
                     await c.download_media(msg, file=str(dest), progress_callback=_prog)
-                    # Save caption as sidecar .txt (only if non-empty)
-                    caption = (msg.message or "").strip()
-                    if caption:
-                        dest.with_suffix(".txt").write_text(caption, encoding="utf-8")
-                    await _db_run(lambda: _db_mark_downloaded(cid, mid, str(dest)))
+                    # Save caption
+                    cap = (msg.message or "").strip()
+                    if cap: dest.with_suffix(".txt").write_text(cap, encoding="utf-8")
+                    
+                    await _db_run(lambda: _db_mark_downloaded(cid, msg_id, str(dest)))
                     job["files"].append(str(dest))
-                    break # Success
+                    log(f"Saved: {fname}")
+                    break
 
                 except errors.FloodWaitError as e:
+                    log(f"Rate limited: wait {e.seconds}s")
                     job["flood_wait"] = e.seconds
-                    job["current"] = f"⏳ Rate limited (attempt {attempt+1}/3) — waiting {e.seconds}s…"
                     await asyncio.sleep(e.seconds)
                     job.pop("flood_wait", None)
-                    if attempt == 2:
-                        job["errors"].append(f"{fname}: Max retries (FloodWait)")
                 except Exception as e:
+                    log(f"Error {fname}: {e}")
                     job["errors"].append(f"{fname}: {e}")
-                    break # Non-recoverable or unknown error
+                    break
         finally:
             job["done"] = job.get("done", 0) + 1
-            job["current"] = fname
             job["pct"] = round(job["done"] / job["total"] * 100, 1)
 
+    job.update({"status": "running", "logs": [], "files": [], "errors": []})
+    log(f"Started batch download of {job['total']} items")
+    
     sem = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     async def bounded(item: dict) -> None:
-        async with sem:
-            await one(item)
+        async with sem: await one(item)
 
     await asyncio.gather(*[bounded(i) for i in items])
     status = "cancelled" if cancel.is_set() else "done"
     job.update({"status": status, "pct": 100, "current": None})
+    log(f"Batch {status}")
     st.cancel_evts.pop(job_id, None)
     asyncio.create_task(_cleanup_job(job_id))
 
@@ -493,12 +523,13 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
     
     def log(msg):
         logger.info(f"[{job_id}] {msg}")
-        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[:50]
+        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[-100:]
         # Auto-upsert status to DB
         asyncio.create_task(_db_run(lambda: _db_upsert_mirror({
             "id": job_id, "source_id": src_id, "target_id": dst_id,
             "status": job["status"], "total": job["total"], "current": job.get("current"),
-            "last_msg_id": job.get("last_msg_id", 0)
+            "last_msg_id": job.get("last_msg_id", 0),
+            "logs": job.get("logs", [])
         })))
 
     try:
@@ -593,3 +624,32 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
     finally:
         st.cancel_evts.pop(job_id, None)
         asyncio.create_task(_cleanup_job(job_id))
+
+
+async def _restore_jobs():
+    """Load previous mirror jobs from DB on startup, including sync_activity logs."""
+    rows = await _db_run(_db_get_mirrors)
+    for r in rows:
+        jid = r["id"]
+        # Convert DB row to UI job format
+        total = r["total"] or 0
+        current = r["current"] or 0
+        job = {
+            "status": r["status"],
+            "total": total,
+            "done": current if r["status"] == "done" else 0, # Approximation for display
+            "current": None,
+            "logs": json.loads(r["logs"] or '[]'),
+            "pct": round(current / total * 100, 1) if total > 0 else 0
+        }
+        
+        if jid == "sync_activity":
+            st.jobs["sync_activity"] = job
+            continue
+
+        # If it was running/queued, mark as interrupted/error on startup
+        if job["status"] in ("running", "queued"):
+            job["status"] = "error"
+            job["logs"] = (job["logs"] + [f"{datetime.now().strftime('%H:%M:%S')} Job interrupted by server restart."])[-100:]
+        
+        st.jobs[jid] = job

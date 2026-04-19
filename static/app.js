@@ -41,12 +41,15 @@ if (document.body.classList.contains('idx-page')) {
     let selChs = new Set();
     let items = new Map();   // key="cid_mid" → item object
     let selItems = new Set();
+    let lastSelKey = null;   // For shift-click
+    let lastSelChId = null;  // For sidebar shift-click
     let filter = 'all';
     let stream = null;
     let paused = false;
     let renderBuf = [];
     let cardIdx = 0;
     let viewMode = 'gallery';
+    const gap = 12;
 
     const COLORS = ['#4f8eff', '#ff6b8a', '#35d47b', '#ffb84f', '#a78bff', '#ff9b3d', '#0ecfcf'];
 
@@ -120,6 +123,15 @@ if (document.body.classList.contains('idx-page')) {
       folders = []; activeFolder = '';
       loadMirrors();
       loadSyncRules();
+      
+      // Initialize persistent sync activity log
+      addMirrorCard('sync_activity', 'Live', 'Sync', 'Running');
+      const esSync = new EventSource('/api/download/sync_activity/progress');
+      esSync.onmessage = e => {
+        const d = JSON.parse(e.data);
+        if (d.logs) updateMirrorLogs('sync_activity', d.logs);
+      };
+
       document.getElementById('chlist').innerHTML =
         '<div style="padding:8px;display:grid;gap:6px">' +
         '<div class="sk" style="height:56px"></div>'.repeat(5) + '</div>';
@@ -142,6 +154,140 @@ if (document.body.classList.contains('idx-page')) {
       };
       es.onerror = () => es.close();
       updViewport();
+      startLiveUpdates();
+      initHoverPreview();
+    }
+
+    function initHoverPreview() {
+      const tp = document.getElementById('true-preview');
+      let peekT;
+
+      window.showTruePreview = (key, e) => {
+        clearTimeout(peekT);
+        peekT = setTimeout(() => {
+          const it = items.get(key);
+          if (!it) return;
+          
+          tp.innerHTML = '';
+          if (it.type === 'video') {
+            const v = document.createElement('video');
+            v.src = `/api/file/${it.channel_id}/${it.msg_id}`;
+            v.autoplay = true; v.muted = true; v.loop = true;
+            tp.appendChild(v);
+          } else if (it.type === 'photo') {
+            const img = document.createElement('img');
+            img.src = `/api/file/${it.channel_id}/${it.msg_id}`;
+            tp.appendChild(img);
+          } else {
+            return; // No peek for docs
+          }
+          
+          tp.style.display = 'block';
+          moveTruePreview(e);
+        }, 300); // 300ms debounce
+      };
+
+      window.hideTruePreview = () => {
+        clearTimeout(peekT);
+        tp.style.display = 'none';
+        tp.innerHTML = '';
+      };
+
+      window.moveTruePreview = (e) => {
+        if (tp.style.display !== 'block') return;
+        let x = e.clientX + 20;
+        let y = (e.type === 'keydown' ? e.clientY + 50 : e.clientY + 20);
+        
+        const pad = 15;
+        if (x + 450 > window.innerWidth) x = e.clientX - 470;
+        if (x < pad) x = pad;
+        if (y + tp.offsetHeight > window.innerHeight) y = window.innerHeight - tp.offsetHeight - pad;
+        if (y < pad) y = pad;
+        
+        tp.style.left = x + 'px'; tp.style.top = y + 'px';
+      };
+
+      window.updGridSize = (val) => {
+        document.documentElement.style.setProperty('--row-h', val + 'px');
+        renderVirtual();
+      };
+
+      window.peekByKeys = (dir, e) => {
+        if (!filteredKeys.length) return;
+        
+        // Remove old focus
+        document.querySelectorAll('.mc.kb-focus').forEach(el => el.classList.remove('kb-focus'));
+
+        let columns = Math.floor(mgrid.clientWidth / (parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220));
+        if (columns < 1) columns = 1;
+
+        if (dir === 'left') peekIdx--;
+        else if (dir === 'right') peekIdx++;
+        else if (dir === 'up') peekIdx -= columns;
+        else if (dir === 'down') peekIdx += columns;
+
+        if (peekIdx < 0) peekIdx = 0;
+        if (peekIdx >= filteredKeys.length) peekIdx = filteredKeys.length - 1;
+
+        const key = filteredKeys[peekIdx];
+        const item = items.get(key);
+        if (!item) return;
+
+        // Ensure visible
+        const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+        const row = Math.floor(peekIdx / columns);
+        const targetTop = row * rowH;
+        
+        if (targetTop < mgrid.scrollTop) mgrid.scrollTop = targetTop;
+        else if (targetTop + rowH > mgrid.scrollTop + mgrid.clientHeight) mgrid.scrollTop = targetTop + rowH - mgrid.clientHeight;
+
+        // Show preview
+        const cards = document.querySelectorAll('.mc');
+        let cardEl = null;
+        for (const c of cards) { if (c.dataset.key === key) { cardEl = c; break; } }
+        
+        let rect = { left: 100, top: 100 };
+        if (cardEl) {
+          cardEl.classList.add('kb-focus');
+          rect = cardEl.getBoundingClientRect();
+        }
+
+        // Trigger preview
+        clearTimeout(peekT);
+        tp.innerHTML = '';
+        if (item.type === 'video') {
+          const v = document.createElement('video');
+          v.src = `/api/file/${item.channel_id}/${item.msg_id}`;
+          v.autoplay = true; v.muted = true; v.loop = true;
+          tp.appendChild(v);
+        } else if (item.type === 'photo') {
+          const img = document.createElement('img');
+          img.src = `/api/file/${item.channel_id}/${item.msg_id}`;
+          tp.appendChild(img);
+        }
+        tp.style.display = 'block';
+        tp.style.left = (rect.left + 50) + 'px';
+        tp.style.top = (rect.top + 50) + 'px';
+      };
+    }
+
+    function startLiveUpdates() {
+      if (window.updateES) window.updateES.close();
+      const es = new EventSource('/api/updates');
+      window.updateES = es;
+      es.onmessage = e => {
+        const ev = JSON.parse(e.data);
+        if (ev.type === 'new_message') {
+          const ch = allChs.find(c => c.id === ev.channel_id);
+          if (ch) {
+            ch.unread = (ch.unread || 0) + 1;
+            ch.pulsing = true;
+            renderChannelList();
+            setTimeout(() => { ch.pulsing = false; renderChannelList(); }, 600);
+          }
+        }
+      };
+      es.onerror = () => { es.close(); setTimeout(startLiveUpdates, 5000); };
     }
 
     function renderFolderTabs() {
@@ -154,8 +300,19 @@ if (document.body.classList.contains('idx-page')) {
         el.className = 'ftabs';
         parent.insertBefore(el, ss);
       }
-      const tabs = [{name: '', emoji: '', label: 'All'}];
+      
+      const hasUnreadTab = folders.some(f => f.name.toLowerCase() === 'unread');
+      const tabs = [
+        {name: '', emoji: '🏠', label: 'All'}
+      ];
+      
+      // Only add virtual unread if user doesn't have an official one
+      if (!hasUnreadTab) {
+        tabs.push({name: 'unread_virtual', emoji: '🔔', label: 'Unread'});
+      }
+      
       folders.forEach(f => tabs.push({...f, label: (f.emoji ? f.emoji + ' ' : '') + f.name}));
+      
       el.innerHTML = tabs.map(t =>
         `<button class="ftab${t.name === activeFolder ? ' active' : ''}" onclick="setFolder('${esc(t.name)}')">${esc(t.label)}</button>`
       ).join('');
@@ -172,22 +329,40 @@ if (document.body.classList.contains('idx-page')) {
       return COLORS[Math.abs([...t].reduce((a, c) => a + c.charCodeAt(0), 0)) % COLORS.length];
     }
 
+    let currentVisibleChs = [];
+
     function renderChannelList() {
       const list = document.getElementById('chlist');
       if (!list) return;
+
       list.innerHTML = '';
       const searchQ = (document.querySelector('#sp-channels .sw input')?.value || '').toLowerCase();
       let filtered = allChs;
-      if (activeFolder) {
+      
+      const isActiveUnread = activeFolder === 'unread_virtual' || activeFolder.toLowerCase() === 'unread';
+
+      if (isActiveUnread) {
+        // Show ONLY unread channels
+        filtered = filtered.filter(c => (c.unread || 0) > 0);
+      } else if (activeFolder === '') {
+        // All view: Show ONLY read channels (per user request)
+        filtered = filtered.filter(c => (c.unread || 0) === 0);
+      } else {
+        // Custom folder view
         filtered = filtered.filter(c => c.folders && c.folders.includes(activeFolder));
       }
+
       if (searchQ) {
         filtered = filtered.filter(c => c.title.toLowerCase().includes(searchQ));
       }
+
+      currentVisibleChs = filtered.map(c => c.id);
+      
       if (!filtered.length) {
         list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No channels</div>';
         return;
       }
+
       filtered.forEach(ch => appendCh(ch, list));
       updMirDatalist();
     }
@@ -218,25 +393,45 @@ if (document.body.classList.contains('idx-page')) {
       const div = document.createElement('div');
       div.className = 'ch' + (sel ? ' sel' : '');
       div.dataset.id = ch.id;
-      div.onclick = () => toggleCh(ch.id, div);
+      div.onclick = (e) => toggleCh(ch.id, div, e);
       const mem = ch.members
         ? `${ch.members > 999 ? (ch.members / 1000).toFixed(1) + 'k' : ch.members} members`
         : ch.type;
       const folderBadge = ch.folders?.length
         ? `<span class="ch-folder">${esc(ch.folders[0])}</span>` : '';
+      
+      const unreadIndicator = ch.unread > 0 
+        ? `<div class="ch-dot ${ch.pulsing ? 'pulse' : ''}"></div>` 
+        : '';
+
       div.innerHTML = `
-        <div class="av" style="background:${color}20;color:${color}">${ch.title.charAt(0).toUpperCase()}</div>
+        <div class="av" style="background:${color}15;color:${color}">${ch.title.charAt(0).toUpperCase()}</div>
         <div class="ci"><div class="cn">${esc(ch.title)}</div><div class="cm">${mem} ${folderBadge}</div></div>
-        <div class="ck">${sel ? chk() : ''}</div>`;
+        <div class="cr">${unreadIndicator}<div class="ck">${sel ? chk() : ''}</div></div>`;
       list.appendChild(div);
     }
 
-    function toggleCh(id, el) {
-      if (selChs.has(id)) { selChs.delete(id); el.classList.remove('sel'); el.querySelector('.ck').innerHTML = ''; }
-      else { selChs.add(id); el.classList.add('sel'); el.querySelector('.ck').innerHTML = chk(); }
+    function toggleCh(id, el, e) {
+      if (e && e.shiftKey && lastSelChId && currentVisibleChs.includes(lastSelChId)) {
+        const idxA = currentVisibleChs.indexOf(lastSelChId);
+        const idxB = currentVisibleChs.indexOf(id);
+        const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+        for (let i = start; i <= end; i++) selChs.add(currentVisibleChs[i]);
+      } else {
+        if (selChs.has(id)) {
+          selChs.delete(id);
+          lastSelChId = null;
+        } else {
+          selChs.add(id);
+          lastSelChId = id;
+        }
+      }
+      
       const btn = document.getElementById('vmbtn');
       btn.textContent = `${selChs.size} selected`;
       updSelAllBtn();
+      renderChannelList();
+
       // Auto-load immediately on selection change
       if (selChs.size > 0) loadMedia();
       else {
@@ -283,6 +478,13 @@ if (document.body.classList.contains('idx-page')) {
       if (activeFolder) visible = visible.filter(c => c.folders && c.folders.includes(activeFolder));
       const allSel = visible.length > 0 && visible.every(c => selChs.has(c.id));
       btn.textContent = allSel ? 'Deselect All' : 'Select All';
+
+      const sf = document.querySelector('.sf');
+      if (sf) {
+        if (selChs.size > 0) sf.classList.add('active');
+        else sf.classList.remove('active');
+      }
+      updSelCount();
     }
 
     function updPillCounts() {
@@ -307,7 +509,7 @@ if (document.body.classList.contains('idx-page')) {
     window.switchSTab = (name, el) => {
       document.querySelectorAll('.stab').forEach(t => t.classList.remove('active'));
       el.classList.add('active');
-      document.querySelectorAll('.sidebar-pane').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.sidebar .sidebar-pane').forEach(p => p.classList.remove('active'));
       document.getElementById('sp-' + name)?.classList.add('active');
       if (name === 'channels') updViewport();
     };
@@ -325,8 +527,8 @@ if (document.body.classList.contains('idx-page')) {
       const grid = document.getElementById('mgrid');
       if (!grid) return;
       viewportHeight = grid.clientHeight;
-      const cardW = (viewMode === 'gallery') ? 250 : 152;
-      columns = Math.floor((grid.clientWidth - 12) / (cardW + 8)) || 1;
+      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+      columns = Math.floor((grid.clientWidth - 24) / rowH) || 1;
       renderVirtual();
     }
 
@@ -335,31 +537,31 @@ if (document.body.classList.contains('idx-page')) {
       if (!grid) return;
 
       if (!filteredKeys.length) {
-        grid.innerHTML = '';
-        grid.style.height = '';
+        grid.innerHTML = ''; grid.style.height = '';
         return;
       }
 
-      // Recalc viewport if needed (first render)
-      if (!viewportHeight) {
-        viewportHeight = grid.clientHeight || 600;
-        const cardW = (viewMode === 'gallery') ? 250 : 152;
-        columns = Math.floor((grid.clientWidth - 12) / (cardW + 8)) || 1;
-      }
-
-      const gap = 8;
-      const rowH = (viewMode === 'gallery') ? 258 : 160;
+      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+      columns = Math.floor((grid.clientWidth - 24) / rowH) || 1;
       const totalRows = Math.ceil(filteredKeys.length / columns);
       const totalH = totalRows * rowH;
 
-      // Set grid to full scroll height
-      grid.style.height = totalH + 'px';
+      let spacer = grid.querySelector('.vs-spacer');
+      if (!spacer) {
+        spacer = document.createElement('div');
+        spacer.className = 'vs-spacer';
+        spacer.style.width = '1px';
+        spacer.style.position = 'absolute';
+        grid.prepend(spacer);
+      }
+      spacer.style.height = totalH + 'px';
       grid.style.position = 'relative';
 
       const st = grid.scrollTop;
-      const buffer = 3; // extra rows above/below
+      const vh = grid.clientHeight || 800;
+      const buffer = 4;
       const startRow = Math.max(0, Math.floor(st / rowH) - buffer);
-      const endRow = Math.min(totalRows, Math.ceil((st + viewportHeight) / rowH) + buffer);
+      const endRow = Math.min(totalRows, Math.ceil((st + vh) / rowH) + buffer);
 
       const startIdx = startRow * columns;
       const endIdx = Math.min(endRow * columns, filteredKeys.length);
@@ -368,6 +570,7 @@ if (document.body.classList.contains('idx-page')) {
 
       // Remove out-of-view cards
       for (const child of Array.from(grid.children)) {
+        if (child.classList.contains('lasso') || child.classList.contains('vs-spacer')) continue;
         if (!visibleSet.has(child.dataset.key)) {
           grid.removeChild(child);
         }
@@ -390,15 +593,19 @@ if (document.body.classList.contains('idx-page')) {
           grid.appendChild(el);
         }
 
-        // Position via CSS grid — use transform for GPU acceleration
+        // Position via absolute — use transform for GPU acceleration
         const globalIdx = startIdx + i;
         const row = Math.floor(globalIdx / columns);
         const col = globalIdx % columns;
         el.style.position = 'absolute';
-        el.style.width = `calc((100% - ${(columns - 1) * gap}px) / ${columns})`;
+        
+        const totalGapWidth = (columns - 1) * gap;
+        const itemWidth = (grid.clientWidth - 24 - totalGapWidth) / columns;
+        
+        el.style.width = itemWidth + 'px';
         el.style.height = (rowH - gap) + 'px';
-        el.style.left = `calc(${col} * (100% - ${(columns - 1) * gap}px) / ${columns} + ${col * gap}px)`;
-        el.style.top = (row * rowH) + 'px';
+        el.style.left = (12 + col * (itemWidth + gap)) + 'px';
+        el.style.top = (row * rowH + 12) + 'px';
       });
     }
 
@@ -408,6 +615,85 @@ if (document.body.classList.contains('idx-page')) {
         if (vsRAF) return;
         vsRAF = requestAnimationFrame(() => { vsRAF = null; renderVirtual(); });
       }, { passive: true });
+
+      // ── Lasso Selection (Drag-to-select) ───────────────────────────────────
+      let lasso = null, startX, startY;
+      let initialSel = new Set();
+      let scrollTimer = null;
+
+      mgrid.onmousedown = e => {
+        if (e.target.closest('button, input, select, .mpreview')) return;
+        
+        const rect = mgrid.getBoundingClientRect();
+        startX = e.clientX - rect.left;
+        startY = e.clientY - rect.top + mgrid.scrollTop;
+        
+        lasso = document.createElement('div');
+        lasso.className = 'lasso';
+        mgrid.appendChild(lasso);
+        
+        initialSel = new Set(selItems);
+        
+        const onMove = ev => {
+          if (!lasso) return;
+          const currentX = ev.clientX - rect.left;
+          const currentY = ev.clientY - rect.top + mgrid.scrollTop;
+          
+          const left = Math.min(startX, currentX);
+          const top = Math.min(startY, currentY);
+          const width = Math.abs(startX - currentX);
+          const height = Math.abs(startY - currentY);
+          
+          lasso.style.left = left + 'px';
+          lasso.style.top = top + 'px';
+          lasso.style.width = width + 'px';
+          lasso.style.height = height + 'px';
+          
+          const lassoBounds = { left, top, right: left + width, bottom: top + height };
+          const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+          const totalGapWidth = (columns - 1) * gap;
+          const itemWidth = (mgrid.clientWidth - 24 - totalGapWidth) / columns;
+          const colW = itemWidth + gap;
+          
+          const rStart = Math.max(0, Math.floor((lassoBounds.top - 12) / rowH));
+          const rEnd = Math.floor((lassoBounds.bottom - 12) / rowH);
+          const cStart = Math.max(0, Math.floor((lassoBounds.left - 12) / colW));
+          const cEnd = Math.min(columns - 1, Math.floor((lassoBounds.right - 12) / colW));
+          
+          const isMod = ev.shiftKey || ev.ctrlKey || ev.metaKey;
+          const lassoed = new Set();
+          for (let r = rStart; r <= rEnd; r++) {
+            for (let c = cStart; c <= cEnd; c++) {
+              const idx = r * columns + c;
+              if (idx >= 0 && idx < filteredKeys.length) lassoed.add(filteredKeys[idx]);
+            }
+          }
+          if (!isMod) selItems.clear();
+          if (isMod) initialSel.forEach(k => selItems.add(k));
+          lassoed.forEach(k => selItems.add(k));
+          renderVirtual();
+          updSelCount();
+
+          // Auto-scroll when dragging near edges
+          const threshold = 40;
+          const speed = 15;
+          const rect = mgrid.getBoundingClientRect();
+          if (ev.clientY < rect.top + threshold) {
+            mgrid.scrollTop -= speed;
+          } else if (ev.clientY > rect.bottom - threshold) {
+            mgrid.scrollTop += speed;
+          }
+        };
+        
+        const onUp = () => {
+          if (lasso) { lasso.remove(); lasso = null; }
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        };
+        
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      };
     }
 
     window.addEventListener('resize', updViewport);
@@ -486,7 +772,7 @@ if (document.body.classList.contains('idx-page')) {
       updViewport();
 
       const grid = document.getElementById('mgrid');
-      grid.style.display = 'grid';
+      grid.style.display = 'block';
       grid.innerHTML = '';
       grid.style.paddingTop = '0';
       grid.style.paddingBottom = '0';
@@ -494,6 +780,8 @@ if (document.body.classList.contains('idx-page')) {
 
       document.getElementById('empty').style.display = 'none';
       document.getElementById('sbar').classList.add('active');
+      document.getElementById('pause-btn').style.display = 'block';
+      document.getElementById('stop-btn').style.display = 'block';
       let cnt = 0;
 
       const ids = [...selChs].join(',');
@@ -521,6 +809,7 @@ if (document.body.classList.contains('idx-page')) {
           stream.close(); stream = null;
           document.getElementById('sbar-txt').textContent = `${cnt} items loaded`;
           document.getElementById('pause-btn').style.display = 'none';
+          document.getElementById('stop-btn').style.display = 'none';
           updPillCounts();
           applyFilters();
           return;
@@ -551,6 +840,17 @@ if (document.body.classList.contains('idx-page')) {
       if (!paused) renderVirtual();
     };
 
+    window.stopStream = () => {
+      if (stream) {
+        stream.close();
+        stream = null;
+        document.getElementById('sbar-txt').textContent = 'Stopped';
+        document.getElementById('pause-btn').style.display = 'none';
+        document.getElementById('stop-btn').style.display = 'none';
+        toast('Media loading stopped', '');
+      }
+    };
+
     // ── Media cards ─────────────────────────────────────────────────────────
     function makeCard(key, item) {
       const sel = selItems.has(key);
@@ -563,9 +863,12 @@ if (document.body.classList.contains('idx-page')) {
           e.stopPropagation();
           openPreview(key);
         } else {
-          toggleSel(key, el);
+          toggleSel(key, el, e);
         }
       };
+      el.onmouseenter = (e) => showTruePreview(key, e);
+      el.onmouseleave = () => hideTruePreview();
+      el.onmousemove = (e) => moveTruePreview(e);
       el.ondblclick = ev => { ev.stopPropagation(); openPreview(key); };
       const ti = { photo: '🖼️', video: '🎬', document: '📄' }[item.type] || '❓';
       const cap = item.caption || '';
@@ -636,9 +939,22 @@ if (document.body.classList.contains('idx-page')) {
       drainThumbQueue();
     }
 
-    function toggleSel(key, el) {
-      if (selItems.has(key)) { selItems.delete(key); el.classList.remove('sel'); }
-      else { selItems.add(key); el.classList.add('sel'); }
+    function toggleSel(key, el, e) {
+      if (e && e.shiftKey && lastSelKey && filteredKeys.includes(lastSelKey)) {
+        const idxA = filteredKeys.indexOf(lastSelKey);
+        const idxB = filteredKeys.indexOf(key);
+        const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+        for (let i = start; i <= end; i++) selItems.add(filteredKeys[i]);
+      } else {
+        if (selItems.has(key)) {
+          selItems.delete(key);
+          lastSelKey = null;
+        } else {
+          selItems.add(key);
+          lastSelKey = key;
+        }
+      }
+      renderVirtual();
       updSelCount();
     }
 
@@ -653,9 +969,39 @@ if (document.body.classList.contains('idx-page')) {
 
     function updSelCount() {
       const n = selItems.size;
-      document.getElementById('selc').textContent = n;
+      const el = document.getElementById('selc');
+      if (el) el.textContent = n;
+      
+      const bb = document.querySelector('.bb');
+      const sf = document.querySelector('.sf');
+      if (bb) {
+        if (n > 0) {
+          bb.classList.add('active');
+          if (sf && sf.classList.contains('active')) bb.classList.add('shifted');
+          else bb.classList.remove('shifted');
+        } else {
+          bb.classList.remove('active');
+          bb.classList.remove('shifted');
+        }
+      }
+
+      // Calculate total size
+      let totalSize = 0;
+      selItems.forEach(k => { const it = items.get(k); if (it) totalSize += it.size || 0; });
+      const sizeStr = n > 0 ? ` · ${hrSize(totalSize)}` : '';
+      const bbc = document.querySelector('.bbc');
+      if (bbc) bbc.innerHTML = `<b>${n}</b> item${n !== 1 ? 's' : ''}${sizeStr} selected`;
+
       const btn = document.getElementById('dlbtn');
       if (btn) btn.disabled = n === 0;
+
+      const sa = document.getElementById('selall-btn');
+      if (sa) {
+        const totalVisible = filteredKeys.length;
+        const allSel = totalVisible > 0 && n >= totalVisible;
+        sa.innerHTML = allSel ? '<span>✓</span> Deselect All' : '<span>✓</span> Select All';
+        sa.classList.toggle('all-selected', allSel);
+      }
     }
 
     window.searchMedia = q => {
@@ -883,9 +1229,13 @@ if (document.body.classList.contains('idx-page')) {
       const card = document.createElement('div');
       card.className = 'pitem'; card.id = `j-${job_id}`;
       card.innerHTML = `
-        <div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div>
+          <button class="vbtn" style="width:auto;padding:3px 8px;font-size:10px;border-radius:6px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1)" onclick="toggleLogs('${job_id}')">Logs</button>
+        </div>
         <div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div>
         <div class="pm"><span id="pc-${job_id}">Queued…</span><span id="pp-${job_id}">0%</span></div>
+        <div id="logs-${job_id}" class="m-logs" style="display:none"></div>
         <div class="perr" id="pe-${job_id}" style="display:none"></div>
         <button class="pcancel" onclick="cancelJob('${job_id}')">Cancel</button>`;
       document.getElementById('plist').prepend(card);
@@ -904,15 +1254,68 @@ if (document.body.classList.contains('idx-page')) {
           const pe = document.getElementById(`pe-${job_id}`);
           pe.style.display = 'block'; pe.textContent = d.errors.slice(-1)[0];
         }
-        if (d.status === 'done') { es.close(); toast(`Download complete — ${d.done} files`, 'ok'); document.querySelector(`#j-${job_id} .pcancel`)?.remove(); }
-        if (d.status === 'cancelled' || d.status === 'error') es.close();
+         if (d.status === 'done') { es.close(); toast(`Download complete — ${d.done} files`, 'ok'); document.querySelector(`#j-${job_id} .pcancel`)?.remove(); }
+         if (d.status === 'cancelled' || d.status === 'error') es.close();
+         if (d.logs) updateMirrorLogs(job_id, d.logs); // Re-use the log updater
       };
       es.onerror = () => es.close();
     }
 
     window.cancelJob = async job_id => {
-      await api(`/api/download/${job_id}/cancel`, { method: 'POST' });
+      try {
+        const st = document.getElementById(`st-${job_id}`) || document.getElementById(`pc-${job_id}`);
+        if (st) st.textContent = 'Cancelling…';
+        
+        // Try regular download cancel
+        const r = await api(`/api/download/${job_id}/cancel`, { method: 'POST' });
+        if (r.cancelled) {
+          toast('Cancellation requested', 'ok');
+          return;
+        }
+
+        // Try live sync stop (if the id is a channel id)
+        const chId = parseInt(job_id);
+        if (!isNaN(chId)) {
+          await api('/api/mirror/sync/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_id: chId, target_id: 0 }) 
+          });
+          toast('Live Sync stopped', 'ok');
+          loadSyncRules();
+        }
+      } catch (e) { console.error('Cancel failed', e); }
     };
+
+    window.cancelAllJobs = async () => {
+      const { cancelled } = await api('/api/jobs/cancel-all', { method: 'POST' });
+      document.querySelectorAll('.pitem, .ext-item').forEach(el => {
+        if (!el.textContent.includes('✅') && !el.textContent.includes('🚫')) {
+          const st = el.querySelector('.ext-status') || el.querySelector('.pm span');
+          if (st) st.textContent = 'Cancelling…';
+        }
+      });
+      toast(`Requested cancellation for ${cancelled} jobs`, cancelled > 0 ? 'warn' : '');
+    };
+
+    window.clearDoneJobs = async () => {
+      // User requested to remove this functionality as logs should not be cleared.
+      toast('Clear functionality disabled by user request', 'warn');
+    };
+    window.resetActivity = async () => {
+      if (!confirm('🛑 WARNING: This will permanently stop ALL active sync rules and CLEAR all activity history. Continue?')) return;
+      try {
+        await api('/api/jobs/reset', { method: 'POST' });
+        toast('All activity and logs cleared', 'ok');
+        document.getElementById('plist').innerHTML = '';
+        document.getElementById('mir-history').innerHTML = '';
+        document.getElementById('mir-syncs').innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>';
+        
+        // Re-init sync activity card
+        addMirrorCard('sync_activity', 'Live', 'Sync', 'Running');
+      } catch (e) { toast(e.message, 'err'); }
+    };
+
     window.closeDr = () => document.getElementById('pdrawer').classList.remove('open');
 
     // ── yt-dlp ───────────────────────────────────────────────────────────────
@@ -979,6 +1382,11 @@ if (document.body.classList.contains('idx-page')) {
           es.onmessage = e => {
             const d = JSON.parse(e.data);
             updateMirrorCard(job_id, d);
+            // Auto-view logs for ongoing mirror
+            if (d.status === 'running' || d.status === 'queued') {
+              const box = document.getElementById(`logs-${job_id}`);
+              if (box && box.style.display === 'none') toggleLogs(job_id);
+            }
             if (d.status === 'done' || d.status === 'cancelled' || d.status === 'error') es.close();
           };
           es.onerror = () => es.close();
@@ -991,62 +1399,112 @@ if (document.body.classList.contains('idx-page')) {
       if (document.getElementById(`job-${id}`)) return;
       const card = document.createElement('div');
       card.className = 'ext-item'; card.id = `job-${id}`;
+      const isSync = id === 'sync_activity';
       card.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:start">
-          <div class="ext-url">👯 ${esc(src)} → ${esc(dst)}</div>
-          <button class="vbtn" style="padding:2px 6px;font-size:9px" onclick="toggleLogs('${id}')">Logs</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px">
+          <div class="ext-url" style="min-width:0;flex:1;font-size:13px" title="${esc(src)} → ${esc(dst)}">${isSync ? '✨ Live Sync Activity' : '👯 ' + esc(src) + ' ➜ ' + esc(dst)}</div>
+          <button class="vbtn" style="width:auto;flex-shrink:0;padding:4px 12px;font-size:11px;border-radius:20px;background:${isSync ? 'var(--accent)' : 'var(--adim)'};border:1px solid var(--accent);color:${isSync ? '#fff' : 'var(--accent)'}" onclick="toggleLogs('${id}')">${isSync ? 'Hide Logs' : 'Show Logs'}</button>
         </div>
-        <div id="st-${id}" style="color:var(--muted);font-size:11px">${status}</div>
-        <div class="ext-prog"><div class="ext-pbar" id="pb-${id}"></div></div>
-        <div id="logs-${id}" class="m-logs" style="display:none"></div>
-        <button class="pcancel" style="margin-top:6px" onclick="cancelJob('${id}')">Cancel</button>`;
+        <div id="st-${id}" class="ext-status" style="color:var(--muted)">${isSync ? 'Monitoring background rules...' : status}</div>
+        <div class="ext-prog" ${isSync ? 'style="display:none"' : ''}><div class="ext-pbar" id="pb-${id}"></div></div>
+        <div id="logs-${id}" class="m-logs" ${isSync ? 'style="display:block"' : 'style="display:none"'}></div>
+        ${isSync ? '' : `<button class="pcancel" style="width:100%;margin-top:10px;border-radius:8px;padding:6px" onclick="cancelJob('${id}')">Cancel Job</button>`}`;
       hist.prepend(card);
       if (logs.length) updateMirrorLogs(id, logs);
     }
+
+    const jobStats = new Map(); // job_id -> {lastDone, lastTime}
 
     function updateMirrorCard(id, d) {
       const pb = document.getElementById(`pb-${id}`);
       if (pb) pb.style.width = (d.pct || 0) + '%';
       const st = document.getElementById(`st-${id}`);
       if (!st) return;
+
+      // Speed calculation
+      let speedText = '';
+      if (d.status === 'running' && d.done !== undefined) {
+        const now = Date.now();
+        const stats = jobStats.get(id) || { lastDone: d.done, lastTime: now, start: now };
+        const elapsed = (now - stats.lastTime) / 1000;
+        if (elapsed > 1.5) {
+          const delta = d.done - stats.lastDone;
+          const speed = delta / elapsed; // items per second
+          if (speed > 0) {
+            speedText = ` · ${speed.toFixed(1)} items/s`;
+            if (d.total) {
+              const remaining = d.total - d.done;
+              const eta = Math.round(remaining / speed);
+              if (eta > 0) speedText += ` · ETA ${eta}s`;
+            }
+          }
+          jobStats.set(id, { lastDone: d.done, lastTime: now, start: stats.start });
+        }
+      }
+
       if (d.status === 'done') {
         st.textContent = '✅ Sync Complete';
-        st.style.color = '#35d47b';
+        st.style.color = 'var(--ok)';
         document.querySelector(`#job-${id} .pcancel`)?.remove();
       } else if (d.status === 'error') {
         st.textContent = '❌ Error: ' + (d.current || 'Unknown');
-        st.style.color = '#ff6b8a';
+        st.style.color = 'var(--err)';
       } else if (d.status === 'cancelled') {
         st.textContent = '🚫 Cancelled';
       } else {
-        st.textContent = `Cloned ${d.done || 0}/${d.total || '?'}` + (d.current ? ` (${d.current})` : '');
+        st.innerHTML = `Cloned <b>${d.done || 0}</b> / ${d.total || '?'}<span style="opacity:0.6">${speedText}</span>` + 
+                       (d.current ? `<div style="font-size:10px;margin-top:2px;opacity:0.7">${esc(d.current)}</div>` : '');
       }
-      if (d.logs) updateMirrorLogs(id, d.logs);
-    }
-
     function updateMirrorLogs(id, logs) {
       const box = document.getElementById(`logs-${id}`);
       if (!box) return;
-      box.innerHTML = logs.map(l => `<div>${esc(l)}</div>`).join('');
+      const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
+      box.innerHTML = logs.map(l => `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(l)}">${esc(l)}</div>`).join('');
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    if (d.logs) updateMirrorLogs(id, d.logs);
     }
 
     window.toggleLogs = (id) => {
       const box = document.getElementById(`logs-${id}`);
-      box.style.display = box.style.display === 'none' ? 'block' : 'none';
-    };
+      if (!box) return;
+      const btn = document.querySelector(`#job-${id} .vbtn`);
+      const isVisible = box.style.display !== 'none';
+      box.style.display = isVisible ? 'none' : 'block';
+      if (btn && btn.textContent.includes('Logs')) {
+        btn.textContent = isVisible ? 'Show Logs' : 'Hide Logs';
+        btn.style.background = isVisible ? 'var(--adim)' : 'var(--accent)';
+        btn.style.color = isVisible ? 'var(--accent)' : '#fff';
+      }
+    }
 
     async function loadMirrors() {
       try {
         const mirrors = await api('/api/mirrors');
         mirrors.forEach(m => {
           addMirrorCard(m.id, m.source_id, m.target_id, m.status);
-          const st = document.getElementById(`st-${m.id}`);
+          const stEl = document.getElementById(`st-${m.id}`);
           if (m.status === 'done') {
-            st.textContent = '✅ Completed';
-            st.style.color = '#35d47b';
+            stEl.textContent = '✅ Completed';
+            stEl.style.color = '#35d47b';
             document.querySelector(`#job-${m.id} .pcancel`)?.remove();
+          } else if (m.status === 'error') {
+            stEl.textContent = '❌ Error';
+            stEl.style.color = '#ff6b8a';
+          } else if (m.status === 'cancelled') {
+            stEl.textContent = '🚫 Cancelled';
+          } else {
+            // Reconnect progress if running
+            const es = new EventSource(`/api/download/${m.id}/progress`);
+            es.onmessage = e => {
+              const d = JSON.parse(e.data);
+              updateMirrorCard(m.id, d);
+              if (d.status === 'done' || d.status === 'cancelled' || d.status === 'error') es.close();
+            };
+            es.onerror = () => es.close();
           }
-          document.getElementById(`pb-${m.id}`).style.width = '100%';
+          document.getElementById(`pb-${m.id}`).style.width = m.status === 'done' ? '100%' : '0%';
         });
       } catch (e) { console.error('Failed to load mirrors', e); }
     }
@@ -1059,12 +1517,16 @@ if (document.body.classList.contains('idx-page')) {
         if (!rules.length) { box.innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>'; return; }
         
         box.innerHTML = rules.map(r => r.targets.map(t => `
-          <div class="ext-item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-left:2px solid var(--ok)">
-            <div style="font-size:11px">
-              <span class="sb-dot" style="display:inline-block;margin-right:6px"></span>
-              <b>${r.source_id}</b> → <b>${t}</b>
+          <div class="ext-item sync-rule-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+              <div style="font-size:12px;display:flex;align-items:center;gap:8px;min-width:0;flex:1">
+                <span class="sb-dot" style="flex-shrink:0"></span>
+                <span style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0" title="${esc(r.source_id)} ➜ ${esc(t)}">
+                  ${esc(r.source_id)} ➜ ${esc(t)}
+                </span>
+              </div>
+              <button class="vbtn" style="width:auto;flex-shrink:0;padding:3px 10px;font-size:10px;background:var(--err);border-radius:6px" onclick="stopSync('${r.source_id}', '${t}')">Stop</button>
             </div>
-            <button class="vbtn" style="width:auto;padding:2px 8px;font-size:10px;background:var(--err)" onclick="stopSync('${r.source_id}', '${t}')">Stop</button>
           </div>`).join('')).join('');
       } catch (e) { console.error('Sync Rules load failed', e); }
     }
@@ -1083,18 +1545,47 @@ if (document.body.classList.contains('idx-page')) {
 
     // ── Keyboard shortcuts ────────────────────────────────────────────────────
     document.addEventListener('keydown', e => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+      if (isInput) {
         if (e.key === 'Enter' && !e.shiftKey) {
           if (document.getElementById('va')?.classList.contains('active')) doAuth();
           else if (document.getElementById('vo')?.classList.contains('active')) doOtp();
         }
         return;
       }
-      if (e.key === 'Escape') { lbClose(); closeDr(); }
-      if (lb.classList.contains('open')) {
+      if (e.key === 'Escape') { lbClose(); hideTruePreview(); }
+      
+      const lb = document.getElementById('lb');
+      const isLb = lb.classList.contains('active') || lb.classList.contains('open');
+
+      if (isLb) {
         if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); lbNav(-1); return; }
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); lbNav(1); return; }
+        return;
       }
+
+      // Keyboard Peek & Selection
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        const dir = e.key.replace('Arrow', '').toLowerCase();
+        peekByKeys(dir, e);
+        return;
+      }
+
+      if (e.key === ' ') {
+        e.preventDefault();
+        const key = filteredKeys[peekIdx];
+        if (key) {
+          const el = document.querySelector(`.mc[data-key="${key}"]`);
+          toggleSel(key, el, e);
+        }
+      }
+
+      if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) {
+        const key = filteredKeys[peekIdx];
+        if (key) openPreview(key);
+      }
+
       if ((e.metaKey || e.ctrlKey) && e.key === 'a') { e.preventDefault(); selAll(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { if (selItems.size) doDl(); }
     });
@@ -1107,29 +1598,41 @@ if (document.body.classList.contains('idx-page')) {
 
     // ── Resizers ─────────────────────────────────────────────────────────────
     (function() {
-      const g = document.getElementById('gutter');
-      const s = document.querySelector('.sidebar');
-      if (!g || !s) return;
-      let dragging = false;
-      g.addEventListener('mousedown', e => { 
-        e.preventDefault();
-        dragging = true; 
-        g.classList.add('active'); 
-        document.body.style.cursor = 'col-resize';
-        document.body.style.userSelect = 'none';
-      });
-      window.addEventListener('mousemove', e => {
-        if (!dragging) return;
-        const w = Math.min(Math.max(240, e.clientX), 700);
-        s.style.width = w + 'px';
-      });
-      window.addEventListener('mouseup', () => { 
-        if (!dragging) return;
-        dragging = false; 
-        g.classList.remove('active'); 
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      });
+      function setupResizer(id, varName, minW, maxW, isRight = false) {
+        const g = document.getElementById(id);
+        if (!g) return;
+        let dragging = false;
+        let frame;
+        g.addEventListener('mousedown', e => {
+          e.preventDefault();
+          dragging = true;
+          g.classList.add('active');
+          document.body.classList.add('is-dragging');
+        });
+        window.addEventListener('mousemove', e => {
+          if (!dragging) return;
+          if (frame) cancelAnimationFrame(frame);
+          frame = requestAnimationFrame(() => {
+            let w;
+            if (isRight) {
+              w = Math.min(Math.max(minW, window.innerWidth - e.clientX), maxW);
+            } else {
+              w = Math.min(Math.max(minW, e.clientX), maxW);
+            }
+            document.documentElement.style.setProperty(varName, w + 'px');
+          });
+        });
+        window.addEventListener('mouseup', () => {
+          if (!dragging) return;
+          dragging = false;
+          g.classList.remove('active');
+          document.body.classList.remove('is-dragging');
+          if (frame) cancelAnimationFrame(frame);
+        });
+      }
+
+      setupResizer('gutter', '--sidebar-w', 240, 800, false);
+      setupResizer('p-gutter', '--drawer-w', 250, 800, true);
     })();
 
     // ── Boot ──────────────────────────────────────────────────────────────────

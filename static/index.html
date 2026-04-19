@@ -63,14 +63,14 @@
       <div class="logo-icon" style="width:30px;height:30px;font-size:14px">📡</div>
       <div class="logo-text" style="font-size:15px">TGrab</div>
       <div class="tsp"></div>
-      <div style="font-size:11px;color:var(--muted)">⌘A select all · ⌘↵ download · Esc close · ? shortcuts</div>
+      <div class="topbar-hints" style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px" title="⌘A select all · ⌘↵ download · Esc close · ? shortcuts">⌘A select all · ⌘↵ download · Esc close · ? shortcuts</div>
       <div class="status-pill">● Connected</div>
       <button class="btn btn-g" style="width:auto;padding:5px 13px;margin:0;font-size:12px"
         onclick="doLogout()">Logout</button>
     </div>
 
     <div class="ws">
-      <div class="sidebar">
+      <div class="sidebar" style="position:relative">
         <div class="stabs">
           <div class="stab active" onclick="switchSTab('channels',this)">📡 Channels</div>
           <div class="stab" onclick="switchSTab('external',this)">🌐 External</div>
@@ -92,9 +92,9 @@
               <div class="sk" style="height:56px"></div>
             </div>
           </div>
-          <div class="sf" style="display:flex;gap:6px">
-            <button class="vbtn" id="vmbtn" disabled style="cursor:default;opacity:.7;flex:1">0 selected</button>
-            <button class="vbtn" id="selall-ch" onclick="selAllChs()" style="flex:0 0 auto;padding:9px 12px;background:transparent;border:1px solid var(--border);color:var(--muted)">Select All</button>
+          <div class="sf">
+            <button class="vbtn" id="vmbtn" disabled style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">0 selected</button>
+            <button class="vbtn" id="selall-ch" onclick="selAllChs()">Select All</button>
           </div>
         </div>
 
@@ -117,30 +117,40 @@
         <!-- Mirror pane -->
         <div class="sidebar-pane" id="sp-mirror">
           <div class="ext-pane">
-            <div class="f"><label>Source Channel(s) (IDs or Usernames, comma-separated)</label>
-              <input type="text" id="mir-src" placeholder="@src1, @src2, -100..." list="ch-datalist-all">
+            <div class="f"><label>Source Channel(s)</label>
+              <input type="text" id="mir-src" placeholder="@source, -100..." list="ch-datalist-all">
             </div>
-            <div class="f"><label>Target Channel (Destination)</label>
-              <input type="text" id="mir-dst" placeholder="@target_channel" list="ch-datalist-target">
+            <div class="f"><label>Target Channel</label>
+              <input type="text" id="mir-dst" placeholder="@target" list="ch-datalist-target">
             </div>
             <datalist id="ch-datalist-all"></datalist>
             <datalist id="ch-datalist-target"></datalist>
             <div class="f"><label>Limit (Optional)</label>
-              <input type="number" id="mir-lim" placeholder="e.g. 100 (leave empty for all)">
+              <input type="number" id="mir-lim" placeholder="All messages">
             </div>
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
               <input type="checkbox" id="mir-sync" style="width:auto">
-              <label for="mir-sync" style="margin:0;cursor:pointer">Live Sync (Auto-clone new messages)</label>
+              <label for="mir-sync" style="margin:0;cursor:pointer">Live Sync (Auto-clone)</label>
             </div>
-            <p style="font-size:10px;color:var(--muted);margin-bottom:12px">Clones messages from source to target. Supports protected (noforwards) content.</p>
             <button class="btn btn-p" onclick="doMirror()">👯 Start Mirroring</button>
           </div>
-          <div style="margin:20px 15px 10px;font-size:12px;font-weight:600;color:var(--muted)">Active & Past Mirrors</div>
-          <div class="ext-history" id="mir-history"></div>
-          <div style="margin:20px 15px 10px;font-size:12px;font-weight:600;color:var(--muted)">Active Sync Rules</div>
-          <div id="mir-syncs" style="padding:0 15px"></div>
+          <div class="ext-history" id="mir-history-v" style="padding:0 10px"></div>
+        </div>
+
+        <div class="bb">
+          <div class="bbc"><b>0</b> selected</div>
+          <div class="tsp"></div>
+          <button class="ibox-btn" style="background:transparent;border-color:transparent;color:var(--muted);width:auto;padding:0 8px;font-size:11px" onclick="selItems.clear();updSelCount();renderVirtual()">✕</button>
+          <button class="dlbtn" id="dlbtn" disabled onclick="doDl()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
         </div>
       </div>
+
       <div class="gutter" id="gutter"></div>
       <!-- Main -->
       <div class="main">
@@ -163,17 +173,21 @@
               <option value="size-desc">Largest first</option>
               <option value="size-asc">Smallest first</option>
             </select>
-            <button class="ibox-btn" onclick="selAll()">Select All</button>
-            <button class="ibox-btn" id="vwtbtn" onclick="toggleView()">☷ Grid view</button>
+            <div class="zoom-wrap" title="Grid Size">
+              <span>🔳</span>
+              <input type="range" id="grid-zoom" min="120" max="450" value="220" oninput="updGridSize(this.value)">
+            </div>
+            <button class="ibox-btn primary" id="selall-btn" onclick="selAll()"><span>✓</span> Select All</button>
           </div>
         </div>
 
         <!-- Stream status bar -->
         <div class="stream-bar" id="sbar">
           <div class="sb-dot"></div>
-          <span id="sbar-txt">Loading…</span>
+          <span id="sbar-txt" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px">Loading…</span>
           <div class="tsp2"></div>
           <button class="pause-btn" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
+          <button class="pause-btn" id="stop-btn" style="border-color:var(--err);color:var(--err);margin-left:5px;display:none" onclick="stopStream()">⏹ Stop</button>
         </div>
 
         <!-- Empty / grid -->
@@ -186,28 +200,27 @@
         <div class="media-grid gallery-mode" id="mgrid" style="display:none"></div>
       </div>
 
-      <!-- Progress drawer -->
+      <!-- Activity Panel (Rights Sidebar) -->
+      <div class="gutter vertical" id="p-gutter"></div>
       <div class="pd" id="pdrawer">
-        <div class="dh"><span>📥</span><span class="dt">Downloads</span>
-          <button class="dc" onclick="closeDr()">✕</button>
+        <div class="dh">
+          <span>📊</span><span class="dt">Activity & Logs</span>
+          <div style="display:flex;gap:5px">
+            <button class="vbtn" style="width:auto;padding:3px 10px;font-size:10px;background:rgba(255,255,255,0.1);border:1px solid var(--border);border-radius:6px" onclick="cancelAllJobs()">Cancel All</button>
+            <button class="vbtn" style="width:auto;padding:3px 10px;font-size:10px;background:var(--err);border-radius:6px" onclick="resetActivity()">Reset & Clear All</button>
+          </div>
         </div>
-        <div class="pl" id="plist"></div>
+        <div class="sidebar-pane active" style="overflow-y:auto">
+          <div class="s-section-header">Downloads</div>
+          <div id="plist" style="padding:0 10px"></div>
+          
+          <div class="s-section-header">Active Sync Rules</div>
+          <div id="mir-syncs" style="padding:0 10px"></div>
+          
+          <div class="s-section-header">Mirroring Status</div>
+          <div class="ext-history" id="mir-history" style="padding:0 10px"></div>
+        </div>
       </div>
-    </div>
-
-    <!-- Bottom bar -->
-    <div class="bb">
-      <div class="bbc">Selected: <span id="selc">0</span></div>
-      <div class="tsp"></div>
-      <button class="ibox-btn" style="padding:10px 16px;font-size:13px" onclick="doDl()" id="dlbtn2">⬇ Download
-        selected</button>
-      <button class="dlbtn" id="dlbtn" disabled onclick="doDl()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-          <polyline points="7 10 12 15 17 10" />
-          <line x1="12" y1="15" x2="12" y2="3" />
-        </svg>Download
-      </button>
     </div>
   </div>
 
@@ -221,8 +234,10 @@
     <div class="lb-info" id="lb-info"></div>
   </div>
 
+  <div id="true-preview" class="true-preview"></div>
   <!-- Toasts -->
   <div id="toasts"></div>
   <script src="/static/app.js?v=7" defer></script>
 </body>
+
 </html>

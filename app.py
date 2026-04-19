@@ -58,9 +58,9 @@ from telethon.tl.types import (
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
-from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_add_sync_rule, _db_remove_sync_rule
+from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
 from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, _run_mirror, \
-    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust
+    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust, _restore_jobs
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -88,6 +88,8 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         except Exception:
             # Transient network error: keep the client so _client() can reconnect
             logger.warning("Could not verify session on startup (network?); will retry on first request", exc_info=True)
+    
+    await _restore_jobs()
     yield
     # Graceful shutdown: cancel all active downloads
     for evt in st.cancel_evts.values():
@@ -218,10 +220,14 @@ async def stream_channels(request: Request):
                 title = getattr(f, 'title', None)
                 if not title:
                     continue
-                # Handle both string titles and TextWithEntities
                 if hasattr(title, 'text'):
                     title = title.text
                 title = str(title)
+                
+                # USER REQUEST: Remove "Personal" folder
+                if title.lower() == "personal":
+                    continue
+                    
                 folder_names.append({"name": title, "emoji": getattr(f, 'emoticon', '') or ''})
                 for peer in getattr(f, 'include_peers', []):
                     cid = getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
@@ -240,10 +246,8 @@ async def stream_channels(request: Request):
             if not isinstance(e, (types.Channel, types.Chat)):
                 continue
             
-            # Use marked IDs (negative) to avoid Peer ID ambiguity and leverage Telethon's cache
             m_id = utils.get_peer_id(e)
             
-            # Check for posting privileges (Creator or Admin with post rights)
             is_creator = getattr(e, "creator", False)
             admin_rights = getattr(e, "admin_rights", None)
             is_admin = bool(admin_rights and admin_rights.post_messages) if admin_rights else is_creator
@@ -253,6 +257,7 @@ async def stream_channels(request: Request):
                 "title": getattr(e, "title", "?"),
                 "type": "channel" if isinstance(e, types.Channel) else "group",
                 "members": getattr(e, "participants_count", None),
+                "unread": d.unread_count,  # Unified unread count
                 "username": getattr(e, "username", None),
                 "folders": folder_map.get(m_id, []) or folder_map.get(e.id, []), 
                 "is_creator": is_creator,
@@ -496,8 +501,32 @@ async def cancel_download(job_id: str) -> dict[str, bool]:
     ev = st.cancel_evts.get(job_id)
     if ev:
         ev.set()
+        if job_id in st.jobs:
+            st.jobs[job_id]["status"] = "cancelled"
         return {"cancelled": True}
     return {"cancelled": False}
+
+
+@app.post("/api/jobs/cancel-all")
+async def cancel_all_jobs():
+    count = 0
+    for ev in list(st.cancel_evts.values()):
+        ev.set()
+        count += 1
+    return {"cancelled": count}
+
+
+@app.post("/api/jobs/clear-done")
+async def clear_done_jobs():
+    cleared = 0
+    # Create a list of keys to avoid modification during iteration
+    for jid in list(st.jobs.keys()):
+        job = st.jobs.get(jid)
+        if job and job.get("status") in ("done", "cancelled", "error"):
+            st.jobs.pop(jid, None)
+            st.cancel_evts.pop(jid, None)
+            cleared += 1
+    return {"cleared": cleared}
 
 
 @app.get("/api/download/{job_id}/progress")
@@ -597,8 +626,62 @@ async def stop_sync(body: MirrorReq):
 
 
 @app.get("/api/mirror/sync/list")
-async def list_syncs():
-    return [{"source_id": k, "targets": list(v)} for k, v in st.sync_map.items()]
+async def list_sync_rules():
+    rules = await _db_run(_db_get_sync_rules)
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rules:
+        grouped[r["source_id"]].append(r["target_id"])
+    return [{"source_id": s, "targets": t} for s, t in grouped.items()]
+
+
+@app.post("/api/jobs/reset")
+async def reset_activity():
+    # Cancel all running tasks
+    for ev in list(st.cancel_evts.values()):
+        ev.set()
+    
+    # Reset in-memory jobs
+    st.jobs.clear()
+    st.jobs["sync_activity"] = {
+        "status": "running", "type": "sync", 
+        "logs": [f"{datetime.now().strftime('%H:%M:%S')} System: Activity & Logs reset by user."], 
+        "pct": 100
+    }
+    st.sync_map.clear()
+    
+    # Wipe relevant DB tables
+    def _wipe():
+        from db import _db_connect
+        with _db_connect() as c:
+            c.execute("DELETE FROM mirrors")
+            c.execute("DELETE FROM mirrored_messages")
+            c.execute("DELETE FROM sync_rules")
+            c.execute("DELETE FROM downloads") # Optional: user said clean logs, sometimes includes history
+    
+    await _db_run(_wipe)
+    return {"status": "ok"}
+
+
+# ── Activity Sync / Live Updates ──────────────────────────────────────────
+@app.get("/api/updates")
+async def stream_updates(request: Request):
+    async def gen() -> AsyncGenerator[str, None]:
+        q = asyncio.Queue()
+        st.queues.add(q)
+        try:
+            while True:
+                if await request.is_disconnected(): break
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "comment: ping\n\n"
+        finally:
+            st.queues.discard(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Gallery data API ─────────────────────────────────────────────────────────
