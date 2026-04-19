@@ -799,19 +799,61 @@ if (document.body.classList.contains('idx-page')) {
       window.open('/gallery' + (ids ? '?channels=' + ids : ''), '_blank');
     };
 
-    // ── Download ─────────────────────────────────────────────────────────────
+    // ── Download (to user's device via browser) ──────────────────────────────
     window.doDl = async () => {
-      const dItems = [...selItems].map(k => items.get(k)).filter(Boolean)
-        .map(i => ({ channel_id: i.channel_id, msg_id: i.msg_id, filename: i.filename }));
+      const dItems = [...selItems].map(k => items.get(k)).filter(Boolean);
       if (!dItems.length) return;
-      toast(`Starting download of ${dItems.length} files…`, 'ok');
-      const { job_id } = await api('/api/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: dItems })
-      });
-      openDrawer(job_id, dItems.length);
-      [...selItems].forEach(k => document.querySelector(`.mc[data-key="${k}"]`)?.classList.add('dl'));
+
+      toast(`Downloading ${dItems.length} file${dItems.length > 1 ? 's' : ''} to your device…`, 'ok');
+
+      // Show progress drawer
+      const job_id = 'local-' + Date.now();
+      document.getElementById('pdrawer').classList.add('open');
+      const card = document.createElement('div');
+      card.className = 'pitem'; card.id = `j-${job_id}`;
+      card.innerHTML = `
+        <div class="pn">💾 ${dItems.length} file${dItems.length !== 1 ? 's' : ''} → your device</div>
+        <div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div>
+        <div class="pm"><span id="pc-${job_id}">Starting…</span><span id="pp-${job_id}">0%</span></div>
+        <div class="perr" id="pe-${job_id}" style="display:none"></div>`;
+      document.getElementById('plist').prepend(card);
+
+      let done = 0;
+      let errors = 0;
+
+      for (const item of dItems) {
+        const fname = item.filename || `${item.msg_id}`;
+        try {
+          document.getElementById(`pc-${job_id}`).textContent = fname;
+
+          // Use a hidden <a> to trigger a browser save-as download
+          const link = document.createElement('a');
+          link.href = `/api/file/${item.channel_id}/${item.msg_id}`;
+          link.download = fname;
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+
+          // Small delay between files so browser can handle each one
+          if (dItems.length > 1) await new Promise(r => setTimeout(r, 800));
+        } catch (e) {
+          errors++;
+          const pe = document.getElementById(`pe-${job_id}`);
+          pe.style.display = 'block';
+          pe.textContent = `${fname}: ${e.message}`;
+        }
+
+        done++;
+        const pct = Math.round(done / dItems.length * 100);
+        document.getElementById(`pb-${job_id}`).style.width = pct + '%';
+        document.getElementById(`pp-${job_id}`).textContent = pct + '%';
+      }
+
+      document.getElementById(`pc-${job_id}`).textContent = errors
+        ? `✅ ${done - errors} saved, ❌ ${errors} failed`
+        : `✅ ${done} file${done !== 1 ? 's' : ''} sent to browser`;
+      toast(`Download complete — ${done} files`, 'ok');
     };
 
     function openDrawer(job_id, count) {

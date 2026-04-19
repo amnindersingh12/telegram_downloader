@@ -60,7 +60,7 @@ from telethon.tl.types import (
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
 from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded
 from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, \
-    _safe_name, _msg_to_item, _hr_size, _media_type, _ext
+    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -139,7 +139,14 @@ async def auth_init(body: AuthInit) -> dict[str, Any]:
         await st.client.disconnect()
     st.api_id, st.api_hash, st.phone = body.api_id, body.api_hash, body.phone
     st.client = _mk_client(body.api_id, body.api_hash)
-    await st.client.connect()
+    try:
+        await st.client.connect()
+    except (errors.AuthKeyDuplicatedError, Exception) as e:
+        # Session file is corrupted — delete and start fresh
+        logger.warning(f"Session invalid ({e}), creating fresh session")
+        SESSION.with_suffix(".session").unlink(missing_ok=True)
+        st.client = _mk_client(body.api_id, body.api_hash)
+        await st.client.connect()
     if await st.client.is_user_authorized():
         CREDS_FILE.write_text(json.dumps({"api_id": body.api_id, "api_hash": body.api_hash, "phone": body.phone}))
         return {"success": True, "already_authorized": True}
@@ -398,7 +405,65 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
         raise HTTPException(500, str(e))
 
 
-# ── Download ──────────────────────────────────────────────────────────────────
+# ── Browser Download (file streams to user's device) ─────────────────────────
+@app.get("/api/file/{channel_id}/{msg_id}")
+async def get_file(channel_id: int, msg_id: int, request: Request):
+    """Stream a file from Telegram directly to the user's browser for local save."""
+    try:
+        c = await _client()
+        entity = await c.get_entity(channel_id)
+        msg = await c.get_messages(entity, ids=msg_id)
+        if not msg or not msg.media:
+            raise HTTPException(404, "Media not found")
+
+        mt = _media_type(msg)
+        if mt is None:
+            raise HTTPException(400, "Unsupported media type")
+
+        ext = _ext(msg)
+        # Build filename from document attributes or fallback
+        fname = f"{msg_id}{ext}"
+        doc = getattr(msg, "document", None)
+        if doc:
+            for a in doc.attributes:
+                if hasattr(a, "file_name") and a.file_name:
+                    fname = a.file_name
+                    break
+
+        mime = mimetypes.guess_type("file" + ext)[0] or "application/octet-stream"
+        size = _size(msg) if hasattr(msg, 'document') or hasattr(msg, 'photo') else 0
+
+        if mt == "photo":
+            data = await c.download_media(msg, bytes)
+            if not data:
+                raise HTTPException(500, "Failed to download photo")
+            headers = {
+                "Content-Disposition": f'attachment; filename="{fname}"',
+                "Content-Length": str(len(data)),
+            }
+            return Response(data, media_type=mime, headers=headers)
+
+        # For videos/documents, stream chunk by chunk
+        async def _stream() -> AsyncGenerator[bytes, None]:
+            async for chunk in c.iter_download(msg.media, request_size=256 * 1024):
+                if await request.is_disconnected():
+                    break
+                yield chunk
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{fname}"',
+        }
+        if size:
+            headers["Content-Length"] = str(size)
+
+        return StreamingResponse(_stream(), media_type=mime, headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Server-side Download (legacy) ────────────────────────────────────────────
 class DownloadReq(BaseModel):
     items: list[dict]
 
