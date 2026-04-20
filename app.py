@@ -35,6 +35,7 @@ Configuration:
 import asyncio, json, logging, os, re, sqlite3, subprocess, sys, uuid, webbrowser, mimetypes
 from collections import OrderedDict
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("tgrab")
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -60,7 +61,8 @@ from telethon.tl.types import (
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
 from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
 from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, _run_mirror, \
-    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust, _restore_jobs
+    _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust, _restore_jobs, \
+    _fetch_thumb, _thumb_worker
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -85,17 +87,71 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
                 SESSION.with_suffix(".session").unlink(missing_ok=True)
             else:
                 logger.info("Restored Telegram session from disk")
+                # Initialize event handlers and sync rules proactively
+                from core import _on_new_message
+                st.client.add_event_handler(_on_new_message)
+                
+                # Load sync rules
+                rules = await _db_run(_db_get_sync_rules)
+                for r in rules:
+                    sid, tid = r["source_id"], r["target_id"]
+                    if sid not in st.sync_map: st.sync_map[sid] = set()
+                    st.sync_map[sid].add(tid)
+                    logger.info(f"Auto-Sync active: {sid} -> {tid}")
         except Exception:
             # Transient network error: keep the client so _client() can reconnect
             logger.warning("Could not verify session on startup (network?); will retry on first request", exc_info=True)
     
     await _restore_jobs()
+    # Parallel thumbnail workers for high-speed pre-fetching
+    for _ in range(4):
+        asyncio.create_task(_thumb_worker())
+    asyncio.create_task(_cleanup_previews_worker())
     yield
     # Graceful shutdown: cancel all active downloads
     for evt in st.cancel_evts.values():
         evt.set()
+    
+    # Wait briefly for thumb_queue to finish pending tasks
+    if not st.thumb_queue.empty():
+        logger.info(f"Shutdown: waiting for {st.thumb_queue.qsize()} thumbs...")
+        try: await asyncio.wait_for(st.thumb_queue.join(), timeout=3.0)
+        except asyncio.TimeoutError: pass
+
     if st.client and st.client.is_connected():
         await st.client.disconnect()
+
+async def _cleanup_previews_worker():
+    """Background worker that periodically limits the size of the previews/ directory."""
+    while True:
+        try:
+            from config import PREVIEWS
+            if not PREVIEWS.exists(): continue
+            
+            # Max 10GB of previews
+            MAX_SIZE = 10 * 1024 * 1024 * 1024
+            files = []
+            total_size = 0
+            for f in PREVIEWS.glob("*"):
+                if f.is_file():
+                    stat = f.stat()
+                    files.append((stat.st_mtime, stat.st_size, f))
+                    total_size += stat.st_size
+            
+            if total_size > MAX_SIZE:
+                # Sort by mtime (oldest first)
+                files.sort()
+                to_delete = total_size - (MAX_SIZE * 0.8) # Keep 80% of limit
+                deleted = 0
+                for mtime, size, f in files:
+                    if deleted >= to_delete: break
+                    f.unlink(missing_ok=True)
+                    deleted += size
+                logger.info(f"Cleaned up {deleted // (1024*1024)}MB of old previews")
+        except Exception as e:
+            logger.error(f"Preview cleanup worker failed: {e}")
+        
+        await asyncio.sleep(3600) # Check every hour
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -115,6 +171,14 @@ class AuthVerify(BaseModel):
     password: Optional[str] = None
 
 
+@app.get("/api/health")
+async def get_health():
+    return {
+        "status": "ok",
+        "thumb_queue": st.thumb_queue.qsize(),
+        "jobs": len(st.jobs)
+    }
+
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
     if not st.client:
@@ -127,12 +191,6 @@ async def auth_status() -> dict[str, Any]:
         authed = False
     return {"authenticated": authed, "phone": st.phone}
 
-
-@app.get("/api/health")
-async def health() -> dict[str, Any]:
-    authed = bool(st.client and st.client.is_connected()
-                  and await st.client.is_user_authorized())
-    return {"status": "ok", "authenticated": authed}
 
 
 @app.post("/api/auth/init")
@@ -290,78 +348,10 @@ async def get_media(
 
 @app.get("/api/thumb/{channel_id}/{msg_id}")
 async def get_thumb(channel_id: int, msg_id: int):
-    key = f"{channel_id}_{msg_id}"
-    t_path = THUMBS_DIR / f"{key}.jpg"
-    
-    # 1. RAM (O(1))
-    data = st.thumbs.get(key)
-    if data: return Response(data, media_type="image/jpeg", 
-                            headers={"Cache-Control": "public, max-age=604800"})
-    
-    # 2. Disk (Persistent)
-    if t_path.exists():
-        data = t_path.read_bytes()
-        st.thumbs.set(key, data)
-        return Response(data, media_type="image/jpeg", 
-                        headers={"Cache-Control": "public, max-age=604800"})
-        
-    # 3. Telegram — try stripped thumb first (no download, instant)
-    try:
-        c = await _client()
-        entity = await c.get_entity(channel_id)
-        msg = await c.get_messages(entity, ids=msg_id)
-
-        # Try to extract stripped thumbnail bytes (embedded in metadata)
-        thumb_bytes = None
-        media = msg.media if msg else None
-        if media:
-            photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
-            if photo:
-                for sz in getattr(photo, 'thumbs', []) or []:
-                    if hasattr(sz, 'bytes') and sz.bytes:
-                        # PhotoStrippedSize — reconstruct JPEG
-                        raw = sz.bytes
-                        if len(raw) > 0 and raw[0] == 1:
-                            # Stripped format: needs JPEG header/footer
-                            header = bytes([
-                                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
-                                0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-                                0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-                                0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
-                                0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
-                                0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
-                                0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
-                                0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
-                                0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
-                                0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
-                                0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
-                                0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
-                                0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
-                                0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                            ])
-                            footer = bytes([0xFF, 0xD9])
-                            thumb_bytes = header + raw[3:] + footer
-                        else:
-                            thumb_bytes = raw
-                        break
-
-        if not thumb_bytes:
-            # Fallback: download smallest thumb
-            thumb_bytes = await c.download_media(msg, bytes, thumb=-1)
-
-        if thumb_bytes:
-            st.thumbs.set(key, thumb_bytes)
-            t_path.write_bytes(thumb_bytes)
-            return Response(thumb_bytes, media_type="image/jpeg", 
-                            headers={"Cache-Control": "public, max-age=604800"})
-    except Exception as e:
-        logger.error(f"Failed to fetch thumbnail for {channel_id}_{msg_id}: {e}", exc_info=True)
+    thumb_bytes = await _fetch_thumb(channel_id, msg_id)
+    if thumb_bytes:
+        return Response(thumb_bytes, media_type="image/jpeg", 
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
     
     raise HTTPException(404, "Thumbnail unavailable")
 
@@ -374,14 +364,14 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
         # 1. Check if already permanently downloaded
         local_path = await _db_run(lambda: _db_is_downloaded(channel_id, msg_id))
         if local_path and Path(local_path).exists():
-            return FileResponse(local_path, headers={"Cache-Control": "public, max-age=86400"})
+            return FileResponse(local_path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
         # 2. Check preview disk cache
         key = f"{channel_id}_{msg_id}"
         for ext in (".jpg", ".mp4", ".png", ".webp"):
             p = PREVIEWS / f"{key}{ext}"
             if p.exists():
-                return FileResponse(p, headers={"Cache-Control": "public, max-age=86400"})
+                return FileResponse(p, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
         # 3. Fetch from TG
         c = await _client()
@@ -407,7 +397,7 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
             data = await c.download_media(msg, bytes)
             if data:
                 with open(cache_path, "wb") as f: f.write(data)
-            return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+            return Response(data, media_type=mime, headers={"Cache-Control": "public, max-age=31536000, immutable"})
         
         async def _stream() -> AsyncGenerator[bytes, None]:
             # Use msg instead of msg.media to provide context for protected content
@@ -417,7 +407,7 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
                 yield chunk
 
         return StreamingResponse(_stream(), media_type=mime, 
-                                 headers={"Cache-Control": "public, max-age=86400"})
+                                 headers={"Cache-Control": "public, max-age=31536000, immutable"})
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -492,15 +482,18 @@ async def start_download(body: DownloadReq) -> dict[str, str]:
     st.jobs[job_id] = {"status": "queued", "total": 0, "done": 0,
                        "pct": 0, "current": None, "files": [], "errors": []}
     st.cancel_evts[job_id] = asyncio.Event()
-    asyncio.create_task(_run_download(job_id, body.items))
+    st.tasks[job_id] = asyncio.create_task(_run_download(job_id, body.items))
     return {"job_id": job_id}
 
 
 @app.post("/api/download/{job_id}/cancel")
 async def cancel_download(job_id: str) -> dict[str, bool]:
-    ev = st.cancel_evts.get(job_id)
-    if ev:
-        ev.set()
+    # Set event for loop-level checks
+    if job_id in st.cancel_evts:
+        st.cancel_evts[job_id].set()
+    # Cancel task for immediate I/O abort
+    if job_id in st.tasks:
+        st.tasks[job_id].cancel()
         if job_id in st.jobs:
             st.jobs[job_id]["status"] = "cancelled"
         return {"cancelled": True}
@@ -510,9 +503,11 @@ async def cancel_download(job_id: str) -> dict[str, bool]:
 @app.post("/api/jobs/cancel-all")
 async def cancel_all_jobs():
     count = 0
-    for ev in list(st.cancel_evts.values()):
+    for jid, ev in list(st.cancel_evts.items()):
         ev.set()
         count += 1
+    for jid, task in list(st.tasks.items()):
+        task.cancel()
     return {"cancelled": count}
 
 
@@ -568,7 +563,7 @@ async def start_ytdlp(body: YtReq) -> dict[str, str]:
     job_id = str(uuid.uuid4())
     st.jobs[job_id] = {"status": "queued", "pct": 0, "current": None, "url": body.url}
     st.cancel_evts[job_id] = asyncio.Event()
-    asyncio.create_task(_run_ytdlp(job_id, body.url, body.fmt))
+    st.tasks[job_id] = asyncio.create_task(_run_ytdlp(job_id, body.url, body.fmt))
     return {"job_id": job_id}
 
 
@@ -581,16 +576,44 @@ class MirrorReq(BaseModel):
 
 @app.post("/api/mirror/start")
 async def start_mirror(body: MirrorReq) -> dict[str, str]:
+    # 1. Prevent duplicate jobs for same pair
+    for jid, j in st.jobs.items():
+        if j.get("type") == "mirror" and j.get("status") in ("running", "queued"):
+            if str(j.get("source_id")) == str(body.source_id) and str(j.get("target_id")) == str(body.target_id):
+                logger.info(f"Ignoring duplicate mirror request for {body.source_id} -> {body.target_id}")
+                return {"job_id": jid, "status": "already_running"}
+
     job_id = f"mirror_{uuid.uuid4().hex[:8]}"
-    st.jobs[job_id] = {"status": "queued", "type": "mirror", "pct": 0, "current": None, "logs": ["Queued for execution..."]}
+    st.jobs[job_id] = {
+        "id": job_id, "source_id": body.source_id, "target_id": body.target_id,
+        "status": "queued", "type": "mirror", "pct": 0, "current": None, 
+        "logs": ["Queued for execution..."]
+    }
     st.cancel_evts[job_id] = asyncio.Event()
-    asyncio.create_task(_run_mirror(job_id, body.source_id, body.target_id, body.limit))
+    st.tasks[job_id] = asyncio.create_task(_run_mirror(job_id, body.source_id, body.target_id, body.limit))
     return {"job_id": job_id}
 
 
 @app.get("/api/mirrors")
 async def get_mirrors():
-    return await _db_run(_db_get_mirrors)
+    # Return merged live memory state for accuracy on refresh
+    # We prioritize st.jobs (live) over DB rows
+    db_rows = await _db_run(_db_get_mirrors)
+    # Combine - though st.jobs handles everything after restoration
+    # Simplest: just return st.jobs filtered for mirror types
+    mirrors = [j for j in st.jobs.values() if j.get("type") == "mirror" or j.get("id", "").startswith("mirror_")]
+    # Sort: running first, then queued, then others. Within status, sort by ID descending (newest first).
+    def sort_key(j):
+        status_order = {"running": 0, "queued": 1, "done": 2, "error": 3, "cancelled": 4}
+        # Use str(j.get("id")) for lexicographical descending sort as a secondary key
+        return (status_order.get(j.get("status"), 99), -int(j.get("id", "0").split("_")[-1]) if "_" in str(j.get("id", "")) else 0)
+    
+    # Actually, simpler sort for now: status priority, then ID descending
+    mirrors.sort(key=lambda j: (
+        0 if j.get("status") == "running" else (1 if j.get("status") == "queued" else 2),
+        -(int(j["id"].split("_")[1], 16) if "_" in j.get("id", "") else 0)
+    ))
+    return mirrors
 
 
 @app.post("/api/mirror/sync/start")
@@ -686,8 +709,8 @@ async def stream_updates(request: Request):
 
 # ── Gallery data API ─────────────────────────────────────────────────────────
 @app.get("/api/gallery-data")
-async def gallery_data(channels: str = "") -> list[dict[str, Any]]:
-    """Return cached media items for the gallery, with thumb/preview URLs."""
+async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+    """Return cached media items for the gallery, with pagination."""
     if channels:
         ids = [int(x) for x in channels.split(",") if x.strip()]
     else:
@@ -695,8 +718,13 @@ async def gallery_data(channels: str = "") -> list[dict[str, Any]]:
         ids = [ch["id"] for ch in chs]
 
     result = []
+    # For simplicity when multiple channels are selected, we fetch from all
+    # In a perfect world, we'd have a single SQL query for all IDs
     for cid in ids:
-        rows = await _db_read(lambda c=cid: _db_get_media(c, "all"))
+        # Note: This is still a bit heavy for 42 channels if we don't limit per channel
+        # or use a global join. For now, let's limit the total result.
+        if len(result) >= limit: break
+        rows = await _db_read(lambda c=cid: _db_get_media(c, "all", limit=limit, offset=offset))
         for row in rows:
             t = row["type"]
             result.append({
@@ -710,6 +738,10 @@ async def gallery_data(channels: str = "") -> list[dict[str, Any]]:
                 "msg_id":     row["msg_id"],
                 "size":       row.get("size", 0),
             })
+            # Trigger background prefetch for missing thumbs only
+            t_path = THUMBS_DIR / f"{cid}_{row['msg_id']}.jpg"
+            if not t_path.exists():
+                st.thumb_queue.put_nowait((cid, row["msg_id"]))
     return result
 
 
@@ -728,7 +760,7 @@ async def gallery() -> FileResponse:
 
 if __name__ == "__main__":
     async def _run():
-        config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning")
+        config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
         server = uvicorn.Server(config)
 
         async def _open():

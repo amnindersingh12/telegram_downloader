@@ -1,36 +1,41 @@
-import asyncio, sqlite3
+import asyncio, json, sqlite3
 from datetime import datetime
 from typing import Optional, Callable, Any
 from config import DB_FILE
 
 _db_write_lock = asyncio.Lock()
-_conn_cache: sqlite3.Connection | None = None
+import threading
 
+_local = threading.local()
 
 def _db_connect() -> sqlite3.Connection:
-    global _conn_cache
-    if _conn_cache is None:
-        _conn_cache = sqlite3.connect(DB_FILE, check_same_thread=False)
-        _conn_cache.row_factory = sqlite3.Row
-    return _conn_cache
+    if not hasattr(_local, "conn"):
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # Enable WAL for new connections too
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn = conn
+    return _local.conn
 
 
 def _db_init() -> None:
     with _db_connect() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
-        c.execute("PRAGMA cache_size=-8000")       # 8MB in-memory cache
+        c.execute("PRAGMA cache_size=-128000")       # 128MB in-memory cache
         c.execute("PRAGMA temp_store=MEMORY")
         c.execute("PRAGMA mmap_size=67108864")      # 64MB memory-mapped I/O
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY, title TEXT, type TEXT,
-            members INTEGER, username TEXT, cached_at REAL
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY, type TEXT, title TEXT,
+            username TEXT, members INTEGER, can_post INTEGER,
+            unread INTEGER DEFAULT 0, folders TEXT DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS media (
             channel_id INTEGER, msg_id INTEGER, type TEXT,
             filename TEXT, size INTEGER, date TEXT, caption TEXT DEFAULT '',
-            w INTEGER DEFAULT 0, h INTEGER DEFAULT 0,
+            w INTEGER DEFAULT 0, h INTEGER DEFAULT 0, tags TEXT DEFAULT '',
             PRIMARY KEY (channel_id, msg_id)
         );
         CREATE TABLE IF NOT EXISTS downloads (
@@ -52,8 +57,11 @@ def _db_init() -> None:
             PRIMARY KEY (source_id, target_id)
         );
         CREATE INDEX IF NOT EXISTS idx_media_channel ON media(channel_id, msg_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_media_date ON media(channel_id, date DESC);
+        CREATE INDEX IF NOT EXISTS idx_media_filename ON media(filename COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_media_type ON media(channel_id, type);
         CREATE INDEX IF NOT EXISTS idx_downloads_lookup ON downloads(channel_id, msg_id);
+        CREATE INDEX IF NOT EXISTS idx_mirrored_lookup ON mirrored_messages(source_id, source_msg_id);
         """)
         # Migrate older DBs that lack the caption column
         cols = [r["name"] for r in c.execute("PRAGMA table_info(media)").fetchall()]
@@ -128,16 +136,16 @@ def _db_cache_media_batch(items: list[dict]) -> None:
         )
 
 
-def _db_get_media(channel_id: int, mtype: str = "all") -> list[dict]:
+def _db_get_media(channel_id: int, mtype: str = "all", limit: int = 5000, offset: int = 0) -> list[dict]:
     with _db_connect() as c:
         if mtype == "all":
             rows = c.execute(
-                "SELECT * FROM media WHERE channel_id=? ORDER BY msg_id DESC",
+                f"SELECT * FROM media WHERE channel_id=? ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
                 (channel_id,)
             ).fetchall()
         else:
             rows = c.execute(
-                "SELECT * FROM media WHERE channel_id=? AND type=? ORDER BY msg_id DESC",
+                f"SELECT * FROM media WHERE channel_id=? AND type=? ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
                 (channel_id, mtype)
             ).fetchall()
         return [dict(r) for r in rows]

@@ -19,6 +19,9 @@
   </header>
 
   <div class="grid" id="grid"></div>
+  <div id="load-more-container" style="display:flex;justify-content:center;padding:20px 0 60px">
+    <button id="load-more" class="btn btn-g" style="width:200px;display:none" onclick="loadMore()">Load More</button>
+  </div>
 
   <!-- Lightbox -->
   <div class="lb" id="lb" onclick="onBg(event)">
@@ -32,7 +35,9 @@
     </div>
   </div>
 
-  <script src="/static/app.js" defer></script>
+  <div id="toasts"></div>
+  <script src="/static/common.js?v=1"></script>
+  <script src="/static/gallery.js?v=2" defer></script>
 </body>
 
 </html>

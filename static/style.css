@@ -72,7 +72,9 @@ body {
   font-family: var(--font);
   font-size: 14px;
   min-height: 100vh;
+  min-height: 100dvh;
   letter-spacing: -0.01em;
+  overscroll-behavior-y: none;
 }
 
 /* App shell locks scroll; gallery page scrolls freely */
@@ -687,7 +689,7 @@ input:focus {
   border-radius: 6px;
   padding: 8px;
   margin-top: 10px;
-  max-height: 120px;
+  max-height: 250px;
   overflow-y: auto;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
   font-size: 10px;
@@ -969,25 +971,40 @@ select.sort {
 /* Checkbox */
 .mchk {
   position: absolute;
-  top: 7px; left: 7px;
-  width: 22px; height: 22px;
-  background: rgba(0, 0, 0, .30);
-  border: 1.5px solid rgba(255, 255, 255, .60);
+  top: 8px; left: 8px;
+  width: 26px; height: 26px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 2px solid rgba(255, 255, 255, 0.7);
   border-radius: 6px;
   backdrop-filter: blur(8px);
   display: flex;
   align-items: center; justify-content: center;
-  transition: all .2s cubic-bezier(.4, 0, .2, 1);
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
   z-index: 5;
+  opacity: 0;
+  transform: scale(0.9);
 }
+@media (max-width: 768px) {
+  .mchk { opacity: 0.85; transform: scale(1); }
+}
+.mc:hover .mchk { opacity: 1; transform: scale(1); }
 .mchk svg {
   display: block;
   opacity: 0;
-  transform: scale(.5);
-  transition: all .2s cubic-bezier(.175, .885, .32, 1.275);
+  width: 14px; height: 14px;
+  transform: scale(0.5);
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.mc.sel .mchk         { background: var(--accent); border-color: var(--accent); box-shadow: 0 4px 10px rgba(0,0,0,.3); }
-.mc.sel .mchk svg     { opacity: 1; transform: scale(1.1); stroke: #fff; }
+.mc.sel .mchk { 
+  background: var(--accent); 
+  border-color: #fff; 
+  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.5); 
+  opacity: 1;
+  transform: scale(1.05);
+}
+.mc.sel .mchk svg { 
+  opacity: 1; transform: scale(1.2); stroke: #ffffff !important; stroke-width: 2px !important;
+}
 
 /* Type badge */
 .tbadge {
@@ -1689,4 +1706,135 @@ header {
   border-color: var(--accent) !important;
   box-shadow: 0 0 0 2px var(--accent);
   z-index: 10;
+}
+
+/* ============================================================
+   MOBILE LAYOUT & NAVIGATION
+   ============================================================ */
+.mobile-nav {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  body.app-shell { overflow: hidden; }
+  .ws {
+    display: flex; /* Override grid */
+    flex-direction: column;
+    height: calc(100vh - 52px - 64px); 
+    overflow: hidden;
+  }
+  
+  .gutter { display: none !important; }
+  
+  /* Panes act as full screen views */
+  .sidebar, .main, .pd {
+    position: absolute;
+    inset: 0;
+    width: 100% !important;
+    height: 100%;
+    z-index: 1;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(15px) scale(0.98);
+    transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    background: var(--bg);
+  }
+  
+  /* When a mobile pane is active */
+  .sidebar.m-active, .main.m-active, .pd.m-active {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0) scale(1);
+    z-index: 10;
+  }
+
+  .sidebar-pane {
+    height: 100%;
+  }
+
+  .mobile-nav {
+    display: flex;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 64px;
+    background: rgba(15, 18, 25, 0.95);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    z-index: 1500;
+    justify-content: space-around;
+    align-items: center;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .m-nav-item {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 500;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 16px;
+    transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  .m-nav-item.active { color: var(--accent); }
+
+  .m-nav-icon {
+    font-size: 22px;
+    transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), filter 0.3s;
+    filter: drop-shadow(0 0 0 rgba(0, 122, 255, 0));
+  }
+  
+  .m-nav-item.active .m-nav-icon {
+    transform: scale(1.15) translateY(-2px);
+    filter: drop-shadow(0 4px 8px rgba(0, 122, 255, 0.4));
+  }
+
+  .topbar-hints { display: none; }
+  
+  .bb {
+    bottom: 80px; /* above mobile nav */
+    width: calc(100% - 32px);
+    z-index: 1600;
+  }
+  .sf {
+    bottom: 88px;
+    width: calc(100% - 32px);
+    z-index: 1600;
+  }
+
+  .toolbar .t1 {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 8px;
+    scrollbar-width: none;
+  }
+  .toolbar .t1::-webkit-scrollbar { display: none; }
+  
+  .search-wrap { width: auto; flex-grow: 1; }
+  .zoom-wrap { display: none; }
+  .pills { flex-shrink: 0; }
+  
+  .media-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+    display: grid !important; /* Ensure grid on mobile */
+    gap: 12px !important;
+    padding: 12px 12px 100px !important;
+    --row-h: 180px !important;
+  }
+  
+  .pd { width: 100%; border-left: none; }
+  #sbar-txt { max-width: 140px; }
+}
+
+#load-more:hover {
+  background: var(--border);
+  color: var(--text);
+  border-color: var(--accent);
 }

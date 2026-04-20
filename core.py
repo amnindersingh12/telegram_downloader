@@ -4,16 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Any
 from fastapi import HTTPException, Request
-from telethon import TelegramClient, errors
 from telethon.tl import types
 from telethon.tl.types import (
     InputMessagesFilterPhotos, InputMessagesFilterVideo, InputMessagesFilterDocument
 )
-from config import SESSION, DOWNLOADS, THUMB_CACHE_SIZE, MAX_CONCURRENT_DOWNLOADS, JOB_TTL_SECONDS
+from config import SESSION, DOWNLOADS, THUMB_CACHE_SIZE, MAX_CONCURRENT_DOWNLOADS, JOB_TTL_SECONDS, THUMBS_DIR
 from db import _db_run, _db_read, _db_get_media, _db_last_msg_id, _db_cache_media, \
     _db_is_downloaded, _db_mark_downloaded, _db_cache_media_batch, _db_upsert_mirror, \
     _db_get_mirrors, _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, utils
 
 logger = logging.getLogger("tgrab")
 
@@ -39,18 +38,22 @@ class LRU:
 
 
 class _State:
-    client:      Optional[TelegramClient] = None
-    api_id:      Optional[int]  = None
-    api_hash:    Optional[str]  = None
-    phone:       Optional[str]  = None
-    phone_hash:  Optional[str]  = None
-    queues:      set[asyncio.Queue] = set() # SSE event queues
-    jobs:        dict[str, dict] = {
-        "sync_activity": {"status": "running", "type": "sync", "logs": ["Live Sync service started..."], "pct": 100}
-    }
-    cancel_evts: dict[str, asyncio.Event] = {}
-    sync_map:    dict[int, set[int]] = {} # source_id -> {target_ids}
-    thumbs:      LRU = LRU(THUMB_CACHE_SIZE)
+    def __init__(self):
+        self.api_id:      Optional[int] = None
+        self.api_hash:    Optional[str] = None
+        self.phone:       Optional[str] = None
+        self.phone_hash:  Optional[str] = None
+        self.client:      Optional[TelegramClient] = None
+        self.queues:      set[asyncio.Queue] = set()
+        self.jobs:   dict[str, Any] = {
+            "sync_activity": {"status": "running", "type": "sync", "logs": ["Live Sync service started..."], "pct": 100}
+        }
+        self.cancel_evts: dict[str, asyncio.Event] = {}
+        self.tasks: dict[str, asyncio.Task] = {} # Active job tasks for hard cancellation
+        self.sync_map: dict[int, set[int]] = {} # source_id -> {target_ids}
+        self.thumbs:   LRU = LRU(THUMB_CACHE_SIZE)
+        self.thumb_queue: asyncio.Queue = asyncio.Queue()
+        self.entity_cache: dict[int, Any] = {}  # channel_id -> entity object
 
 st = _State()
 
@@ -66,7 +69,7 @@ async def _on_new_message(event):
     for dst_id in targets:
         try:
             # Check for duplicate (though NewMessage shouldn't be duplicate, it's safe)
-            if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)): continue
+            if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): continue
 
             try:
                 await event.client.send_message(dst_id, m, comment_to=None)
@@ -87,16 +90,21 @@ async def _on_new_message(event):
                 else:
                     await event.client.send_message(dst_id, m.message, formatting_entities=m.entities)
             
-            await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
-            logger.info(f"Live Sync: Cloned {src_id} -> {dst_id}")
+            await _db_run(lambda d=dst_id: _db_add_mirror_mapping(src_id, m.id, d))
             # Update UI logs
             from datetime import datetime
-            log_msg = f"{datetime.now().strftime('%H:%M:%S')} Sync: Cloned {src_id} -> {dst_id}"
-            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-100:]
+            extra = ""
+            if m.media:
+                sz = _hr_size(_size(m))
+                mt = _media_type(m).capitalize()
+                extra = f" [{mt}, {sz}]"
+            
+            log_msg = f"{datetime.now().strftime('%H:%M:%S')} [LIVE] Sync: {src_id} ➜ {dst_id}{extra}"
+            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-500:]
         except Exception as e:
             logger.error(f"Live Sync Error: {e}")
             from datetime import datetime
-            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} Error: {e}"])[-100:]
+            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} ERROR: {e}"])[-500:]
         
         # Persist sync_activity state
         await _db_run(lambda: _db_upsert_mirror({
@@ -292,7 +300,117 @@ def _msg_to_item(msg: Any, channel_id: int) -> Optional[dict]:
         "caption": (msg.message or "").strip(),
         "w": w,
         "h": h,
+        "has_media": bool(getattr(msg, 'media', None))
     }
+
+
+async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
+    """
+    Fetch thumbnail for a message. Checks RAM/Disk first. 
+    If missing, fetches from Telegram (stripped then full download).
+    """
+    key = f"{channel_id}_{msg_id}"
+    t_path = THUMBS_DIR / f"{key}.jpg"
+    
+    # 1. RAM (O(1))
+    data = st.thumbs.get(key)
+    if data: return data
+    
+    # 2. Disk (Persistent)
+    if t_path.exists():
+        try:
+            data = t_path.read_bytes()
+            st.thumbs.set(key, data)
+            return data
+        except Exception: pass
+        
+    # 3. Telegram — try stripped thumb first (no download, instant)
+    try:
+        c = await _client()
+        # Use entity cache to avoid repeated get_entity calls
+        if channel_id in st.entity_cache:
+            entity = st.entity_cache[channel_id]
+        else:
+            entity = await c.get_entity(channel_id)
+            st.entity_cache[channel_id] = entity
+        msg = await c.get_messages(entity, ids=msg_id)
+
+        thumb_bytes = None
+        media = msg.media if msg else None
+        if media:
+            photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
+            if photo:
+                for sz in getattr(photo, 'thumbs', []) or []:
+                    if hasattr(sz, 'bytes') and sz.bytes:
+                        # PhotoStrippedSize — reconstruct JPEG
+                        raw = sz.bytes
+                        if len(raw) > 0 and raw[0] == 1:
+                            # Stripped format: needs JPEG header/footer
+                            header = bytes([
+                                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+                                0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+                                0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+                                0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
+                                0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
+                                0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
+                                0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
+                                0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
+                                0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
+                                0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
+                                0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
+                                0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
+                                0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
+                                0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                            ])
+                            footer = bytes([0xFF, 0xD9])
+                            thumb_bytes = header + raw[3:] + footer
+                        else:
+                            thumb_bytes = raw
+                        break
+
+        if not thumb_bytes:
+            # Fallback: download smallest thumb
+            thumb_bytes = await c.download_media(msg, bytes, thumb=-1)
+
+        if thumb_bytes:
+            st.thumbs.set(key, thumb_bytes)
+            t_path.write_bytes(thumb_bytes)
+            return thumb_bytes
+    except Exception as e:
+        logger.error(f"Failed to fetch thumbnail for {channel_id}_{msg_id}: {e}")
+    
+    return None
+
+
+async def _thumb_worker():
+    """Background worker that silently pre-fetches thumbnails from the queue."""
+    logger.info("Thumbnail pre-fetch worker started")
+    
+    async def worker():
+        while True:
+            cid, mid = await st.thumb_queue.get()
+            try:
+                # Direct check first before calling expensive _fetch_thumb
+                t_path = THUMBS_DIR / f"{cid}_{mid}.jpg"
+                if not t_path.exists():
+                    await _fetch_thumb(cid, mid)
+            except errors.FloodWaitError as e:
+                logger.warning(f"Thumb pre-fetch rate limited, pausing {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                logger.debug(f"Background thumb fetch failed for {cid}_{mid}: {e}")
+            finally:
+                st.thumb_queue.task_done()
+
+    # Create 4 concurrent worker consumers
+    for _ in range(4):
+        asyncio.create_task(worker())
 
 
 async def _media_sse(
@@ -324,6 +442,12 @@ async def _media_sse(
             # Emit ALL cached items as a single batch event — far faster than N events
             batch = [dict(r, size_readable=_hr_size(r["size"])) for r in cached]
             yield f"data: {json.dumps({'batch': batch})}\n\n"
+            
+            # Pre-fetch only missing thumbnails for cached items
+            for r in cached:
+                t_path = THUMBS_DIR / f"{cid}_{r['msg_id']}.jpg"
+                if not t_path.exists():
+                    st.thumb_queue.put_nowait((cid, r["msg_id"]))
         
         # Then fetch only NEW messages since last cached
         min_id = last_cached
@@ -347,6 +471,11 @@ async def _media_sse(
         
         if buf:
             await _db_run(lambda b=list(buf): _db_cache_media_batch(b))
+            for i in buf:
+                if i.get("has_media"):
+                    t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.jpg"
+                    if not t_path.exists():
+                        st.thumb_queue.put_nowait((cid, i["msg_id"]))
             buf.clear()
 
     yield 'data: {"done":true}\n\n'
@@ -432,11 +561,17 @@ async def _run_download(job_id: str, items: list[dict]) -> None:
     async def bounded(item: dict) -> None:
         async with sem: await one(item)
 
-    await asyncio.gather(*[bounded(i) for i in items])
-    status = "cancelled" if cancel.is_set() else "done"
-    job.update({"status": status, "pct": 100, "current": None})
-    log(f"Batch {status}")
-    st.cancel_evts.pop(job_id, None)
+    try:
+        await asyncio.gather(*[bounded(i) for i in items])
+        job.update({"status": "done", "pct": 100})
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+    except Exception as e:
+        job.update({"status": "error", "current": str(e)})
+    finally:
+        st.cancel_evts.pop(job_id, None)
+        st.tasks.pop(job_id, None)
+    log(f"Batch {job['status']}")
     asyncio.create_task(_cleanup_job(job_id))
 
 
@@ -503,12 +638,13 @@ async def _run_ytdlp(job_id: str, url: str, fmt: str) -> None:
             job.update({"status": "error", "current": last_line or f"yt-dlp exited with code {rc}"})
         else:
             job.update({"status": "done", "pct": 100, "current": None})
-    except FileNotFoundError:
-        job.update({"status": "error", "current": "yt-dlp not found — install with: pip install yt-dlp"})
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
     except Exception as e:
         job.update({"status": "error", "current": str(e)})
     finally:
         st.cancel_evts.pop(job_id, None)
+        st.tasks.pop(job_id, None)
         asyncio.create_task(_cleanup_job(job_id))
 
 
@@ -517,33 +653,40 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
     job = st.jobs[job_id]
     cancel = st.cancel_evts[job_id]
     job.update({
-        "status": "running", "total": 0, "done": 0, "pct": 0, 
-        "source_id": src_id, "target_id": dst_id, "logs": []
+        "status": "running", "total": job.get("total", 0), "done": job.get("done", 0), "pct": job.get("pct", 0), 
+        "source_id": src_id, "target_id": dst_id, "logs": job.get("logs", [])
     })
     
-    def log(msg):
+    log_batch_cnt = 0
+    def log(msg, force=False):
+        nonlocal log_batch_cnt
         logger.info(f"[{job_id}] {msg}")
-        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[-100:]
-        # Auto-upsert status to DB
-        asyncio.create_task(_db_run(lambda: _db_upsert_mirror({
-            "id": job_id, "source_id": src_id, "target_id": dst_id,
-            "status": job["status"], "total": job["total"], "current": job.get("current"),
-            "last_msg_id": job.get("last_msg_id", 0),
-            "logs": job.get("logs", [])
-        })))
+        job["logs"] = (job.get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} {msg}"])[-500:]
+        
+        log_batch_cnt += 1
+        if force or log_batch_cnt >= 5: # Reduced batch size for more real-time dashboard updates
+            log_batch_cnt = 0
+            # Auto-upsert status to DB
+            asyncio.create_task(_db_run(lambda: _db_upsert_mirror({
+                "id": job_id, "source_id": src_id, "target_id": dst_id,
+                "status": job["status"], "total": job["total"], "current": job.get("current"),
+                "last_msg_id": job.get("last_msg_id", 0),
+                "logs": job.get("logs", [])
+            })))
 
     try:
-        log(f"Starting mirror from {src_id} to {dst_id}")
+        log(f"Starting mirror from {src_id} to {dst_id}", force=True)
         src = await _get_entity_robust(c, src_id)
         dst = await _get_entity_robust(c, dst_id)
         
         # 1. Collect messages
-        log("Fetching messages...")
+        log("Scanning source channel for new messages...", force=True)
         msgs = []
         async for m in c.iter_messages(src, limit=limit, reverse=True):
             if cancel.is_set(): break
             if isinstance(m.action, types.MessageActionEmpty) or not m.action:
                 msgs.append(m)
+            if len(msgs) % 500 == 0: log(f"Found {len(msgs)} messages so far...")
         
         if not msgs:
             log("No messages found.")
@@ -554,26 +697,33 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
         log(f"Found {len(msgs)} messages. Starting clone...")
         
         # 2. Clone loop
-        for i, m in enumerate(msgs):
+        i = 0
+        while i < len(msgs):
+            m = msgs[i]
             if cancel.is_set(): break
             
             # Deduplication Check
             if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)):
                 log(f"Skipping duplicate msg {m.id}")
-                job["done"] = i + 1
-                job["pct"] = round((i + 1) / job["total"] * 100, 1)
+                i += 1
+                job["done"] = i
+                job["pct"] = round(i / job["total"] * 100, 1)
                 continue
 
             try:
                 # as_copy=True fallback via send_message
                 await c.send_message(dst, m, comment_to=None)
-                log(f"Cloned msg {m.id}")
+                sz = _hr_size(_size(m)) if m.media else "text"
+                log(f"Cloned msg {m.id} ({sz})")
+                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
             except errors.ChatForwardsRestrictedError:
-                log(f"Msg {m.id} is protected. Re-uploading...")
+                sz = _hr_size(_size(m)) if m.media else "text"
+                log(f"Msg {m.id} is protected ({sz}). Re-uploading...")
                 if m.media:
                     from io import BytesIO
                     import mimetypes
                     bio = BytesIO()
+                    log(f" ↓ Downloading msg {m.id} to buffer...")
                     await c.download_media(m, bio)
                     bio.seek(0)
                     
@@ -598,46 +748,63 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
                         else: fn = f"file_{m.id}.dat"
 
                     bio.name = fn
+                    log(f" ↑ Uploading {fn} to target...")
                     await c.send_file(dst, bio, caption=m.message, formatting_entities=m.entities, attributes=attrs)
-                    log(f"Synced: {fn}")
+                    log(f"✅ Re-uploaded: {fn} ({sz})")
                 else:
                     await c.send_message(dst, m.message, formatting_entities=m.entities)
-                    log(f"Synced text: {m.id}")
+                    log(f"✅ Synced text: {m.id}")
                 
                 # Save mapping to prevent future duplicates
                 await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+            except errors.FloodWaitError as e:
+                log(f"⚠ Rate limited: waiting {e.seconds}s...")
+                await asyncio.sleep(e.seconds)
+                continue
             except Exception as e:
-                log(f"Failed msg {m.id}: {e}")
+                log(f"❌ Failed msg {m.id}: {e}")
             
-            job["done"] = i + 1
-            job["pct"] = round((i + 1) / job["total"] * 100, 1)
+            i += 1
+            job["done"] = i
+            job["pct"] = round(i / job["total"] * 100, 1)
             job["last_msg_id"] = m.id
             if (i+1) % 5 == 0: log(f"Progress: {i+1}/{len(msgs)}")
             await asyncio.sleep(0.1) # Faster with high RAM and optimized concurrency
 
         job["status"] = "done" if not cancel.is_set() else "cancelled"
-        log(f"Job {job['status']}")
+        log(f"Job {job['status']}", force=True)
 
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+        log("Mirror job cancelled by user.", force=True)
     except Exception as e:
         logger.error(f"Mirror job {job_id} failed: {e}", exc_info=True)
         job.update({"status": "error", "current": str(e)})
+        log(f"❌ Error: {e}", force=True)
     finally:
         st.cancel_evts.pop(job_id, None)
+        st.tasks.pop(job_id, None)
         asyncio.create_task(_cleanup_job(job_id))
 
 
 async def _restore_jobs():
     """Load previous mirror jobs from DB on startup, including sync_activity logs."""
     rows = await _db_run(_db_get_mirrors)
-    for r in rows:
+    # 1. Collect and deduplicate jobs
+    active_pairs = set()
+    resumable_tasks = [] # (jid, src_id, dst_id)
+    
+    # We iterate reversed (newest first) to prioritize fresh jobs
+    for r in sorted(rows, key=lambda x: x["id"], reverse=True):
         jid = r["id"]
-        # Convert DB row to UI job format
         total = r["total"] or 0
         current = r["current"] or 0
         job = {
+            "id": jid, "source_id": r["source_id"], "target_id": r["target_id"],
             "status": r["status"],
+            "type": "mirror",
             "total": total,
-            "done": current if r["status"] == "done" else 0, # Approximation for display
+            "done": current if r["status"] == "done" else 0,
             "current": None,
             "logs": json.loads(r["logs"] or '[]'),
             "pct": round(current / total * 100, 1) if total > 0 else 0
@@ -647,9 +814,23 @@ async def _restore_jobs():
             st.jobs["sync_activity"] = job
             continue
 
-        # If it was running/queued, mark as interrupted/error on startup
-        if job["status"] in ("running", "queued"):
-            job["status"] = "error"
-            job["logs"] = (job["logs"] + [f"{datetime.now().strftime('%H:%M:%S')} Job interrupted by server restart."])[-100:]
+        # Singleton check: don't auto-resume multiple jobs for the same pair
+        pair = (r["source_id"], r["target_id"])
+        if job["status"] in ("running", "queued", "cancelled"):
+            if pair in active_pairs:
+                # Mark as cancelled if it's a duplicate of a newer job
+                job["status"] = "cancelled"
+                job["logs"].append(f"{datetime.now().strftime('%H:%M:%S')} Superseded by newer job.")
+            elif pair[0] and pair[1]:
+                active_pairs.add(pair)
+                resumable_tasks.append((jid, pair[0], pair[1], job))
+                job["status"] = "queued"
+                job["logs"] = (job["logs"] + [f"{datetime.now().strftime('%H:%M:%S')} Resuming background mirror..."])
         
         st.jobs[jid] = job
+
+    # 2. Start only the unique resumable tasks
+    for jid, src_id, dst_id, job in resumable_tasks:
+        st.cancel_evts[jid] = asyncio.Event()
+        st.tasks[jid] = asyncio.create_task(_run_mirror(jid, src_id, dst_id, None))
+        logger.info(f"Auto-Resumed singleton mirror: {jid} ({src_id} -> {dst_id})")

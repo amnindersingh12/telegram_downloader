@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>TGrab — Telegram Media Downloader</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css?v=6">
@@ -64,6 +64,7 @@
       <div class="logo-text" style="font-size:15px">TGrab</div>
       <div class="tsp"></div>
       <div class="topbar-hints" style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px" title="⌘A select all · ⌘↵ download · Esc close · ? shortcuts">⌘A select all · ⌘↵ download · Esc close · ? shortcuts</div>
+      <div class="status-pill" id="q-status" style="display:none;background:var(--accent);margin-right:8px">⚡ Prefetching...</div>
       <div class="status-pill">● Connected</div>
       <button class="btn btn-g" style="width:auto;padding:5px 13px;margin:0;font-size:12px"
         onclick="doLogout()">Logout</button>
@@ -132,7 +133,7 @@
               <input type="checkbox" id="mir-sync" style="width:auto">
               <label for="mir-sync" style="margin:0;cursor:pointer">Live Sync (Auto-clone)</label>
             </div>
-            <button class="btn btn-p" onclick="doMirror()">👯 Start Mirroring</button>
+            <button class="btn btn-p" onclick="doMirror(this)">👯 Start Mirroring</button>
           </div>
           <div class="ext-history" id="mir-history-v" style="padding:0 10px"></div>
         </div>
@@ -222,6 +223,25 @@
         </div>
       </div>
     </div>
+    <!-- Mobile Navigation Bar -->
+    <nav class="mobile-nav">
+      <button class="m-nav-item active" onclick="showMobilePane('channels', this)">
+        <span class="m-nav-icon">📡</span>
+        <span class="m-nav-label">Channels</span>
+      </button>
+      <button class="m-nav-item" onclick="showMobilePane('main', this)">
+        <span class="m-nav-icon">🖼️</span>
+        <span class="m-nav-label">Media</span>
+      </button>
+      <button class="m-nav-item" onclick="showMobilePane('activity', this)">
+        <span class="m-nav-icon">📊</span>
+        <span class="m-nav-label">Activity</span>
+      </button>
+      <button class="m-nav-item" onclick="showMobilePane('tools', this)">
+        <span class="m-nav-icon">🛠️</span>
+        <span class="m-nav-label">Tools</span>
+      </button>
+    </nav>
   </div>
 
   <!-- Native lightbox -->
@@ -235,9 +255,9 @@
   </div>
 
   <div id="true-preview" class="true-preview"></div>
-  <!-- Toasts -->
   <div id="toasts"></div>
-  <script src="/static/app.js?v=7" defer></script>
+  <script src="/static/common.js?v=1"></script>
+  <script src="/static/app.js?v=8" defer></script>
 </body>
 
 </html>
