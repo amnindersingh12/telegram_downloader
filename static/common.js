@@ -24,9 +24,23 @@ function toast(msg, type = '') {
   t.className = 'toast' + (type ? ' ' + type : '');
   t.textContent = msg;
   el.prepend(t);
+  
+  // Auto-reveal activity panel on technical errors
+  if (type === 'err') {
+    document.querySelector('.ws')?.classList.add('drawer-open');
+  }
+  
   setTimeout(() => t.remove(), 4000);
 }
 function debounce(fn, ms) {
   let t;
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
+
+window.wipeCache = async () => {
+  if (!confirm("Are you sure? This will clear all 300k+ cached media records. You'll need to re-scan to see items again.")) return;
+  try {
+    await fetch('/api/cache/wipe', { method: 'POST' });
+    location.reload();
+  } catch (e) { alert("Wipe failed: " + e.message); }
+};

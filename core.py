@@ -61,64 +61,53 @@ st = _State()
 @events.register(events.NewMessage)
 async def _on_new_message(event):
     src_id = event.chat_id
-    if src_id not in st.sync_map: return
-    
     m = event.message
-    targets = st.sync_map[src_id]
     
-    for dst_id in targets:
-        try:
-            # Check for duplicate (though NewMessage shouldn't be duplicate, it's safe)
-            if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): continue
-
+    # ── 1. Live Sync / Mirroring ───────────────────────────────────────────
+    if src_id in st.sync_map:
+        targets = st.sync_map[src_id]
+        for dst_id in targets:
             try:
-                await event.client.send_message(dst_id, m, comment_to=None)
-            except errors.ChatForwardsRestrictedError:
-                if m.media:
-                    from io import BytesIO
-                    import mimetypes
-                    bio = BytesIO()
-                    await event.client.download_media(m, bio)
-                    bio.seek(0)
-                    fn = m.file.name
-                    doc = getattr(m.media, 'document', None)
-                    if not fn and doc and doc.mime_type:
-                        ex = mimetypes.guess_extension(doc.mime_type)
-                        if ex: fn = f"sync_{m.id}{ex}"
-                    bio.name = fn or f"sync_{m.id}"
-                    await event.client.send_file(dst_id, bio, caption=m.message, formatting_entities=m.entities, attributes=doc.attributes if doc else [])
-                else:
-                    await event.client.send_message(dst_id, m.message, formatting_entities=m.entities)
-            
-            await _db_run(lambda d=dst_id: _db_add_mirror_mapping(src_id, m.id, d))
-            # Update UI logs
-            from datetime import datetime
-            extra = ""
-            if m.media:
-                sz = _hr_size(_size(m))
-                mt = _media_type(m).capitalize()
-                extra = f" [{mt}, {sz}]"
-            
-            log_msg = f"{datetime.now().strftime('%H:%M:%S')} [LIVE] Sync: {src_id} ➜ {dst_id}{extra}"
-            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-500:]
-        except Exception as e:
-            logger.error(f"Live Sync Error: {e}")
-            from datetime import datetime
-            st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [f"{datetime.now().strftime('%H:%M:%S')} ERROR: {e}"])[-500:]
-        
-        # Persist sync_activity state
-        await _db_run(lambda: _db_upsert_mirror({
-            "id": "sync_activity", "source_id": 0, "target_id": 0,
-            "status": "running", "total": 0, "current": None,
-            "logs": st.jobs["sync_activity"].get("logs", [])
-        }))
-    
-    # Notify connected clients about new activity (Unread updates)
+                if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): continue
+                try:
+                    await event.client.send_message(dst_id, m, comment_to=None)
+                except errors.ChatForwardsRestrictedError:
+                    if m.media:
+                        from io import BytesIO
+                        import mimetypes
+                        bio = BytesIO()
+                        await event.client.download_media(m, bio)
+                        bio.seek(0)
+                        fn = m.file.name
+                        doc = getattr(m.media, 'document', None)
+                        if not fn and doc and doc.mime_type:
+                            ex = mimetypes.guess_extension(doc.mime_type)
+                            if ex: fn = f"sync_{m.id}{ex}"
+                        bio.name = fn or f"sync_{m.id}"
+                        await event.client.send_file(dst_id, bio, caption=m.message, formatting_entities=m.entities, attributes=doc.attributes if doc else [])
+                    else:
+                        await event.client.send_message(dst_id, m.message, formatting_entities=m.entities)
+                
+                await _db_run(lambda d=dst_id: _db_add_mirror_mapping(src_id, m.id, d))
+                log_msg = f"{datetime.now().strftime('%H:%M:%S')} [LIVE] Sync: {src_id} ➜ {dst_id}"
+                st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-500:]
+            except Exception as e:
+                logger.error(f"Live Sync Error: {e}")
+
+    # ── 2. Notify connected clients (Unified Updates) ──────────────────────
+    item = _msg_to_item(m, src_id)
+    # Background cache it
+    if item:
+        asyncio.create_task(_db_run(lambda: _db_cache_media_batch([item])))
+        # Also pre-fetch thumb
+        st.thumb_queue.put_nowait((src_id, m.id))
+
     for q in st.queues:
         q.put_nowait({
             "type": "new_message",
             "channel_id": src_id,
-            "msg_id": m.id
+            "msg_id": m.id,
+            "item": item
         })
 
 

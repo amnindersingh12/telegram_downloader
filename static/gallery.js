@@ -7,21 +7,6 @@
   const params = new URLSearchParams(location.search);
   const channels = params.get('channels') || '';
 
-  const thumbObs = new IntersectionObserver(entries => {
-    entries.forEach(e => {
-      if (!e.isIntersecting) return;
-      const card = e.target;
-      const item = items[+card.dataset.idx];
-      if (!item) return;
-      const media = card.querySelector('img, video');
-      if (media && !media.src) {
-        media.src = item.thumb;
-        if (item.type === 'video') media.poster = item.thumb;
-      }
-      thumbObs.unobserve(card);
-    });
-  }, { rootMargin: '400px' });
-
   async function loadGallery() {
     try {
       const r = await fetch(`/api/gallery-data?offset=${offset}&limit=${limit}${channels ? '&channels=' + channels : ''}`);
@@ -40,6 +25,43 @@
     loadGallery();
   };
 
+  function createCard(item, i, grid) {
+    if (!item) return;
+    const card = document.createElement('div');
+    card.className = 'card' + (i % 5 === 1 ? ' wide' : '') + (i % 7 === 3 ? ' tall' : '');
+    card.dataset.idx = i;
+    card.addEventListener('click', () => openLb(i));
+    const isVid = item.type === 'video';
+    card.innerHTML = `
+      ${isVid ? `<video class="card-media" poster="${item.thumb}" preload="none" muted playsinline loop></video>
+        <div class="play-ring"><button class="play-btn" aria-label="Play">
+          <svg viewBox="0 0 20 20"><path d="M5 3l13 7-13 7z"/></svg></button></div>`
+        : `<img class="card-media" src="${item.thumb}" loading="lazy" fetchpriority="high" alt="${esc(item.title)}">`}
+      <div class="badge">${item.type.toUpperCase()}</div>
+      <div class="card-caption">
+        <div class="card-title">${esc(item.title)}</div>
+        ${item.caption ? `<div class="card-sub">${esc(item.caption.slice(0, 80))}</div>` : ''}
+      </div>`;
+    
+    if (isVid) {
+      card.addEventListener('mouseenter', () => {
+        const v = card.querySelector('video');
+        if (v) {
+          if (!v.src && item.preview) {
+            v.src = item.preview;
+            v.load();
+          }
+          v.play().catch(() => {});
+        }
+      });
+      card.addEventListener('mouseleave', () => {
+        const v = card.querySelector('video');
+        if (v) v.pause();
+      });
+    }
+    grid.appendChild(card);
+  }
+
   function render() {
     const grid = document.getElementById('grid');
     if (!grid) return;
@@ -57,25 +79,27 @@
 
     const start = offset === 0 ? 0 : items.length - limit;
     for (let i = start; i < items.length; i++) {
-      const item = items[i];
-      if (!item) continue;
-      const card = document.createElement('div');
-      card.className = 'card' + (i % 5 === 1 ? ' wide' : '') + (i % 7 === 3 ? ' tall' : '');
-      card.dataset.idx = i;
-      card.addEventListener('click', () => openLb(i));
-      const isVid = item.type === 'video';
-      card.innerHTML = `
-        ${isVid ? `<video class="card-media" preload="none" muted playsinline></video>
-          <div class="play-ring"><button class="play-btn" aria-label="Play">
-            <svg viewBox="0 0 20 20"><path d="M5 3l13 7-13 7z"/></svg></button></div>`
-          : `<img class="card-media" alt="${esc(item.title)}" loading="lazy">`}
-        <div class="badge">${item.type.toUpperCase()}</div>
-        <div class="card-caption">
-          <div class="card-title">${esc(item.title)}</div>
-          ${item.caption ? `<div class="card-sub">${esc(item.caption.slice(0, 80))}</div>` : ''}
-        </div>`;
-      grid.appendChild(card);
-      thumbObs.observe(card);
+      createCard(items[i], i, grid);
+    }
+  }
+
+  function fullRender() {
+    const grid = document.getElementById('grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    const photos = items.filter(i => i.type === 'photo').length;
+    const videos = items.filter(i => i.type === 'video').length;
+    const hct = document.getElementById('hct');
+    if (hct) hct.textContent = `${photos} photo${photos !== 1 ? 's' : ''} · ${videos} video${videos !== 1 ? 's' : ''}`;
+
+    if (!items.length) {
+      grid.innerHTML = '<div class="empty"><div class="empty-icon">🖼</div><div>No media in cache yet</div></div>';
+      return;
+    }
+
+    for (let i = 0; i < items.length; i++) {
+      createCard(items[i], i, grid);
     }
   }
 
@@ -157,6 +181,43 @@
   lb?.addEventListener('touchstart', e => { tx = e.touches[0].clientX; }, { passive: true });
   lb?.addEventListener('touchend', e => { const dx = e.changedTouches[0].clientX - tx; if (Math.abs(dx) > 50) nav(dx < 0 ? 1 : -1); });
 
+  let es = null;
+  function startLiveUpdates() {
+    if (es) es.close();
+    es = new EventSource('/api/updates');
+    es.onmessage = e => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.type === 'new_message' && d.item) {
+          const item = d.item;
+          if (channels) {
+            const allowed = channels.split(',');
+            if (!allowed.includes(String(item.channel_id))) return;
+          }
+          if (!items.some(i => i.msg_id === item.msg_id && i.channel_id === item.channel_id)) {
+            items.unshift(item);
+            offset++;
+            // Prepend directly to DOM for smoothness
+            const grid = document.getElementById('grid');
+            if (grid) {
+              const dummy = document.createElement('div');
+              createCard(item, 0, dummy); // idx doesn't matter for first item prepend
+              const card = dummy.firstElementChild;
+              if (card) {
+                grid.insertBefore(card, grid.firstChild);
+                // Shift all dataset-idx in the grid
+                const cards = grid.querySelectorAll('.card');
+                cards.forEach((c, idx) => { c.dataset.idx = idx; });
+              }
+            }
+          }
+        }
+      } catch {}
+    };
+    es.onerror = () => { es.close(); setTimeout(startLiveUpdates, 5000); };
+  }
+
+  startLiveUpdates();
   loadGallery();
 
 })(); 

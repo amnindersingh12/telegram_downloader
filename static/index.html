@@ -60,22 +60,46 @@
   <!-- App -->
   <div id="vapp" class="view">
     <div class="topbar">
-      <div class="logo-icon" style="width:30px;height:30px;font-size:14px">📡</div>
-      <div class="logo-text" style="font-size:15px">TGrab</div>
+      <div class="logo" style="margin:0; gap:10px">
+        <div class="logo-icon" style="width:28px; height:28px; font-size:14px; border-radius:8px">📡</div>
+        <div class="logo-text" style="font-size:16px; letter-spacing:-0.5px">TGrab</div>
+      </div>
+      
+      <div style="width:1px; height:20px; background:var(--border); margin:0 8px"></div>
+
+      <button class="status-pill" onclick="toggleSidebar()" title="Toggle Sidebar">
+        <span>📁</span> Sidebar
+      </button>
+
       <div class="tsp"></div>
-      <div class="topbar-hints" style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px" title="⌘A select all · ⌘↵ download · Esc close · ? shortcuts">⌘A select all · ⌘↵ download · Esc close · ? shortcuts</div>
-      <div class="status-pill" id="q-status" style="display:none;background:var(--accent);margin-right:8px">⚡ Prefetching...</div>
-      <div class="status-pill">● Connected</div>
-      <button class="btn btn-g" style="width:auto;padding:5px 13px;margin:0;font-size:12px"
-        onclick="doLogout()">Logout</button>
+
+      <div class="status-pill active" id="conn-status" style="gap:12px">
+        <div style="display:flex; align-items:center; gap:5px">
+          <span style="width:6px; height:6px; background:var(--ok); border-radius:50%"></span>
+          Connected
+        </div>
+        <div id="q-status" style="display:none; font-size:10px; color:var(--accent); font-weight:600; border-left:1px solid var(--border); padding-left:10px">⚡ Prefetching...</div>
+      </div>
+
+      <button class="status-pill" onclick="toggleActivity()" title="Terminal & Activity" style="width:36px; height:36px; padding:0; justify-content:center; border-radius:50%">
+        <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none" style="opacity:0.8">
+          <polyline points="4 17 10 11 4 5"></polyline>
+          <line x1="12" y1="19" x2="20" y2="19"></line>
+        </svg>
+      </button>
+
+      <button class="status-pill" onclick="doLogout()" style="color:var(--err); border-radius:30px">
+        Logout
+      </button>
     </div>
 
     <div class="ws">
       <div class="sidebar" style="position:relative">
         <div class="stabs">
-          <div class="stab active" onclick="switchSTab('channels',this)">📡 Channels</div>
-          <div class="stab" onclick="switchSTab('external',this)">🌐 External</div>
-          <div class="stab" onclick="switchSTab('mirror',this)">👯 Mirror</div>
+          <div class="stab active" onclick="switchSTab('channels',this)" title="Channels">📡</div>
+          <div class="stab" onclick="switchSTab('gallery',this)" title="Gallery">🖼️</div>
+          <div class="stab" onclick="switchSTab('external',this)" title="External">🌐</div>
+          <div class="stab" onclick="switchSTab('mirror',this)" title="Mirror">👯</div>
         </div>
 
         <!-- Channels pane -->
@@ -97,6 +121,25 @@
             <button class="vbtn" id="vmbtn" disabled style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">0 selected</button>
             <button class="vbtn" id="selall-ch" onclick="selAllChs()">Select All</button>
           </div>
+        </div>
+
+        <!-- Gallery pane -->
+        <div class="sidebar-pane" id="sp-gallery" style="padding:15px">
+          <div style="font-size:13px; font-weight:600; margin-bottom:12px; color:var(--text)">Gallery Settings</div>
+          
+          <div class="f" style="margin-bottom:20px">
+            <label style="font-size:10px; margin-bottom:10px">Grid Item Size</label>
+            <div style="display:flex; align-items:center; gap:10px">
+              <span style="font-size:12px; opacity:0.5">🔳</span>
+              <input type="range" id="grid-zoom" min="120" max="450" value="180" oninput="updGridSize(this.value)" style="flex:1">
+            </div>
+          </div>
+
+          <div style="font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:20px">
+            Adjust the grid size and layout behavior. This applies to both the channel view and the global gallery.
+          </div>
+          
+          <button class="btn btn-p" onclick="loadGlobalGallery()" style="margin-top:auto">View All Indexed Media</button>
         </div>
 
         <!-- External pane -->
@@ -161,34 +204,37 @@
               <button class="pill active" onclick="setFilter('all',this)">All</button>
               <button class="pill" onclick="setFilter('photo',this)">📷 Photos</button>
               <button class="pill" onclick="setFilter('video',this)">🎬 Videos</button>
-              <button class="pill" onclick="setFilter('document',this)">📄 Docs</button>
             </div>
-            <div class="tsp2"></div>
-            <div class="search-wrap"><span class="si">🔍</span>
-              <input type="text" id="msearch" placeholder="Search files…">
+
+            <div style="width:1px; height:16px; background:var(--border); margin:0 4px"></div>
+
+            <div class="search-wrap">
+              <span class="si">🔍</span>
+              <input type="text" id="msearch" placeholder="Search...">
             </div>
-            <select class="sort" onchange="sortMedia(this.value)">
-              <option value="">Sort…</option>
-              <option value="date-desc">Newest first</option>
-              <option value="date-asc">Oldest first</option>
-              <option value="size-desc">Largest first</option>
-              <option value="size-asc">Smallest first</option>
-            </select>
-            <div class="zoom-wrap" title="Grid Size">
-              <span>🔳</span>
-              <input type="range" id="grid-zoom" min="120" max="450" value="150" oninput="updGridSize(this.value)">
+
+            <div style="width:1px; height:16px; background:var(--border); margin:0 4px"></div>
+
+            <div class="pills">
+              <button class="pill" id="selall-btn" onclick="selAll()" title="Select All Visible">
+                <span>✓</span>
+              </button>
+              <select class="sort" onchange="sortMedia(this.value)" style="background:transparent; border:none; width:80px; font-size:11px">
+                <option value="">Sort</option>
+                <option value="date-desc">Newest</option>
+                <option value="size-desc">Largest</option>
+              </select>
             </div>
-            <button class="ibox-btn primary" id="selall-btn" onclick="selAll()"><span>✓</span> Select All</button>
           </div>
         </div>
 
         <!-- Stream status bar -->
-        <div class="stream-bar" id="sbar">
-          <div class="sb-dot"></div>
-          <span id="sbar-txt" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px">Loading…</span>
+        <div class="stream-bar" id="sbar" style="height:32px; padding:0 20px; font-size:11px; margin-top:-6px; z-index:90">
+          <div class="sb-dot" style="width:6px; height:6px"></div>
+          <span id="sbar-txt" style="opacity:0.8">Loading…</span>
           <div class="tsp2"></div>
-          <button class="pause-btn" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
-          <button class="pause-btn" id="stop-btn" style="border-color:var(--err);color:var(--err);margin-left:5px;display:none" onclick="stopStream()">⏹ Stop</button>
+          <button class="pause-btn" id="pause-btn" onclick="togglePause()" style="font-size:10px; padding:2px 8px">⏸ Pause</button>
+          <button class="pause-btn" id="stop-btn" style="border-color:var(--err); color:var(--err); margin-left:5px; display:none; font-size:10px; padding:2px 8px" onclick="stopStream()">⏹ Stop</button>
         </div>
 
         <!-- Empty / grid -->
@@ -229,9 +275,9 @@
         <span class="m-nav-icon">📡</span>
         <span class="m-nav-label">Channels</span>
       </button>
-      <button class="m-nav-item" onclick="showMobilePane('main', this)">
+      <button class="m-nav-item" onclick="loadGlobalGallery(); showMobilePane('main', this)">
         <span class="m-nav-icon">🖼️</span>
-        <span class="m-nav-label">Media</span>
+        <span class="m-nav-label">Gallery</span>
       </button>
       <button class="m-nav-item" onclick="showMobilePane('activity', this)">
         <span class="m-nav-icon">📊</span>

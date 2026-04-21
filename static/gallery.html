@@ -15,7 +15,10 @@
     <button class="h-back" onclick="history.back()">← Back</button>
     <div class="h-logo">📡 TGrab <span class="h-sub">Gallery</span></div>
     <div class="h-ct" id="hct">Loading…</div>
-    <button class="h-mode" onclick="toggleMode()">☀ / ☾</button>
+    <div style="display:flex;gap:8px;align-items:center">
+      <!-- Mode toggle -->
+      <button class="h-mode" onclick="toggleMode()">☀ / ☾</button>
+    </div>
   </header>
 
   <div class="grid" id="grid"></div>

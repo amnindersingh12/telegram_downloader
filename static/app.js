@@ -6,7 +6,8 @@ if (document.body.classList.contains('idx-page')) {
     // ── State ──────────────────────────────────────────────────────────────
     let allChs = [];
     let selChs = new Set();
-    let items = new Map();   // key="cid_mid" → item object
+    let mediaRegistry = new Map(); // GLOBAL RAM CACHE: key="cid_mid" → item object
+    let items = new Map();          // Currently active/visible items
     let selItems = new Set();
     let lastSelKey = null;   // For shift-click
     let lastSelChId = null;  // For sidebar shift-click
@@ -17,6 +18,120 @@ if (document.body.classList.contains('idx-page')) {
     let cardIdx = 0;
     let viewMode = 'gallery';
     const gap = 12;
+
+    // ── IndexedDB Caching ────────────────────────────────────────────────
+    const DB_NAME = 'tgrab_cache';
+    const STORE_NAME = 'media_items';
+    let idb = null;
+
+    async function initDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 2);
+        req.onupgradeneeded = e => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+            store.createIndex('channel_id', 'channel_id', { unique: false });
+          }
+          if (!db.objectStoreNames.contains('channels')) {
+            db.createObjectStore('channels', { keyPath: 'id' });
+          }
+          if (!db.objectStoreNames.contains('thumbs')) {
+            db.createObjectStore('thumbs', { keyPath: 'key' });
+          }
+        };
+        req.onsuccess = e => { idb = e.target.result; resolve(idb); };
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    async function storeThumb(key, blob) {
+      if (!idb) return;
+      const tx = idb.transaction('thumbs', 'readwrite');
+      tx.objectStore('thumbs').put({ key, blob });
+    }
+
+    async function getThumb(key) {
+      if (!idb) return null;
+      return new Promise(resolve => {
+        const req = idb.transaction('thumbs', 'readonly').objectStore('thumbs').get(key);
+        req.onsuccess = () => resolve(req.result?.blob || null);
+        req.onerror = () => resolve(null);
+      });
+    }
+
+    async function cacheChannels(chs) {
+      if (!idb) return;
+      const tx = idb.transaction('channels', 'readwrite');
+      const store = tx.objectStore('channels');
+      chs.forEach(c => store.put(c));
+    }
+
+    async function getCachedChannels() {
+      if (!idb) return [];
+      return new Promise(resolve => {
+        const tx = idb.transaction('channels', 'readonly');
+        const store = tx.objectStore('channels');
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    async function cacheBatch(itemsArray) {
+      if (!idb) return;
+      const tx = idb.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      itemsArray.forEach(it => {
+        const key = `${it.channel_id}_${it.msg_id}`;
+        store.put({ key, ...it });
+      });
+    }
+
+    async function getCachedItems(channelIds) {
+      if (!idb) return [];
+      
+      // Try RAM first if we have it
+      if (mediaRegistry.size > 0) {
+        const results = [];
+        mediaRegistry.forEach(it => {
+          if (channelIds.includes(it.channel_id)) results.push(it);
+        });
+        if (results.length > 0) return results;
+      }
+
+      return new Promise((resolve) => {
+        const tx = idb.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const index = store.index('channel_id');
+        let results = [];
+        let count = 0;
+        
+        channelIds.forEach(cid => {
+          const req = index.getAll(IDBKeyRange.only(cid));
+          req.onsuccess = () => {
+            results = results.concat(req.result);
+            count++;
+            if (count === channelIds.length) resolve(results);
+          };
+          req.onerror = () => { count++; if (count === channelIds.length) resolve(results); };
+        });
+      });
+    }
+
+    async function hydrateRAM() {
+      if (!idb) return;
+      const tx = idb.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        req.result.forEach(it => {
+          it.hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
+          mediaRegistry.set(it.key, it);
+        });
+        console.log(`RAM Hydrated: ${mediaRegistry.size} items`);
+      };
+    }
 
     const COLORS = ['#4f8eff', '#ff6b8a', '#35d47b', '#ffb84f', '#a78bff', '#ff9b3d', '#0ecfcf'];
 
@@ -92,6 +207,18 @@ if (document.body.classList.contains('idx-page')) {
       // Initialize persistent sync activity log - and await other mirrors
       await loadMirrors();
       loadSyncRules();
+      await initDB();
+      
+      // Instant load channels from cache
+      const cachedChs = await getCachedChannels();
+      if (cachedChs.length) {
+        allChs = cachedChs;
+        renderChannelList();
+        renderFolderTabs();
+      }
+
+      // Background RAM hydration
+      hydrateRAM();
       
       // Add sync activity card - if it doesn't exist, it will be prepended (top)
       if (!document.getElementById('job-sync_activity')) {
@@ -117,7 +244,12 @@ if (document.body.classList.contains('idx-page')) {
           renderFolderTabs();
           return;
         }
-        if (d.done) { es.close(); renderChannelList(); return; }
+        if (d.done) { 
+          es.close(); 
+          renderChannelList(); 
+          cacheChannels(allChs);
+          return; 
+        }
         // Deduplicate: remove if exists, then push (to update)
         allChs = allChs.filter(c => c.id !== d.id);
         allChs.push(d);
@@ -156,27 +288,35 @@ if (document.body.classList.contains('idx-page')) {
 
       window.showTruePreview = (key, e) => {
         clearTimeout(peekT);
-        peekT = setTimeout(() => {
-          const it = items.get(key);
+        // Small 30ms debounce to skip items the user is just passing over
+        peekT = setTimeout(async () => {
+          const it = items.get(key) || mediaRegistry.get(key);
           if (!it) return;
           
           tp.innerHTML = '';
+          // Show thumb as placeholder while full preview loads
+          const thumbBlob = await getThumb(key);
+          const thumbUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : null;
+
           if (it.type === 'video') {
             const v = document.createElement('video');
+            if (thumbUrl) v.poster = thumbUrl;
             v.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
             v.autoplay = true; v.muted = true; v.loop = true;
             tp.appendChild(v);
           } else if (it.type === 'photo') {
-            const img = document.createElement('img');
+            const img = new Image();
+            if (thumbUrl) img.style.backgroundImage = `url(${thumbUrl})`;
+            img.style.backgroundSize = 'cover';
             img.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
             tp.appendChild(img);
           } else {
-            return; // No peek for docs
+            return;
           }
           
           tp.style.display = 'block';
           moveTruePreview(e);
-        }, 300); // 300ms debounce
+        }, 30);
       };
 
       window.hideTruePreview = () => {
@@ -277,6 +417,19 @@ if (document.body.classList.contains('idx-page')) {
             ch.pulsing = true;
             renderChannelList();
             setTimeout(() => { ch.pulsing = false; renderChannelList(); }, 600);
+          }
+          // Live Gallery Update
+          if (ev.item && selChs.has(ev.channel_id)) {
+            const key = `${ev.item.channel_id}_${ev.item.msg_id}`;
+            if (!mediaRegistry.has(key)) {
+              ev.item.key = key;
+              ev.item.hay = `${ev.item.filename || ''} ${ev.item.caption || ''} ${ev.item.date || ''} ${ev.item.type || ''}`.toLowerCase();
+              mediaRegistry.set(key, ev.item);
+              items.set(key, ev.item);
+              allMediaKeys.push(key);
+              allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
+              requestAnimationFrame(() => applyFilters());
+            }
           }
         }
       };
@@ -385,6 +538,15 @@ if (document.body.classList.contains('idx-page')) {
       div.className = 'ch' + (sel ? ' sel' : '');
       div.dataset.id = ch.id;
       div.onclick = (e) => toggleCh(ch.id, div, e);
+      div.onmouseenter = () => {
+        // Predictive pre-render: populate items from registry while hovering
+        if (!selChs.has(ch.id)) {
+          const cached = [];
+          mediaRegistry.forEach(it => { if (it.channel_id === ch.id) cached.push(it); });
+          if (cached.length > 0) console.log(`Pre-warmed ${cached.length} items for ${ch.title}`);
+        }
+      };
+
       const mem = ch.members
         ? `${ch.members > 999 ? (ch.members / 1000).toFixed(1) + 'k' : ch.members} members`
         : ch.type;
@@ -507,7 +669,7 @@ if (document.body.classList.contains('idx-page')) {
       el.classList.add('active');
       document.querySelectorAll('.sidebar .sidebar-pane').forEach(p => p.classList.remove('active'));
       document.getElementById('sp-' + name)?.classList.add('active');
-      if (name === 'channels') updViewport();
+      if (name === 'channels' || name === 'gallery') updViewport();
     };
 
     // ── Virtual Scroller State ──────────────────────────────────────────────
@@ -750,69 +912,103 @@ if (document.body.classList.contains('idx-page')) {
       renderVirtual();
     }
 
-    window.loadMedia = () => {
-      if (!selChs.size) return;
-      cardIdx = 0;
-      if (stream) { stream.close(); stream = null; }
-      items.clear(); selItems.clear(); allMediaKeys = []; updSelCount();
-      renderBuf = []; paused = false;
-      updViewport();
+    let loadNonce = 0;
+    window.loadMedia = async () => {
+      const nonce = ++loadNonce;
+      if (!selChs.size) {
+        items.clear(); allMediaKeys = [];
+        document.getElementById('mgrid').innerHTML = '';
+        document.getElementById('empty').style.display = 'flex';
+        updPillCounts(); return;
+      }
+      
+      // Optimistic logic: don't clear everything if we are just adding a channel
+      // But for "truly fast" we just rebuild the keys in RAM.
+      allMediaKeys = []; 
+      items.clear(); 
 
       const grid = document.getElementById('mgrid');
       if (grid) {
         grid.style.display = 'block';
-        grid.innerHTML = '';
-        grid.style.paddingTop = '0'; grid.style.paddingBottom = '0';
-        grid.onscroll = renderVirtual;
+        // Optimization: don't wipe grid if we have many items, virtual scroller will handle it
       }
       document.getElementById('empty').style.display = 'none';
       document.getElementById('sbar').classList.add('active');
       document.getElementById('pause-btn').style.display = 'block';
       document.getElementById('stop-btn').style.display = 'block';
-      let cnt = 0;
+      
+      const sbarTxt = document.getElementById('sbar-txt');
+      sbarTxt.textContent = 'Mapping memory...';
 
-      const ids = [...selChs].join(',');
+      // ── Instant Load from RAM Registry ─────────────────────────────────
+      const chIds = [...selChs];
+      mediaRegistry.forEach(it => {
+        if (chIds.includes(it.channel_id)) {
+          items.set(it.key, it);
+          allMediaKeys.push(it.key);
+        }
+      });
+      
+      if (allMediaKeys.length > 0) {
+        allMediaKeys.sort((a, b) => {
+          const ia = items.get(a), ib = items.get(b);
+          return (ib.msg_id - ia.msg_id);
+        });
+        sbarTxt.textContent = `${items.size} items (instant)`;
+        updPillCounts();
+        applyFilters();
+      }
+
+      if (stream) { stream.close(); stream = null; }
+      const ids = chIds.join(',');
       let url = `/api/media?channels=${ids}&type=all`;
       stream = new EventSource(url);
 
       stream.onmessage = e => {
+        if (nonce !== loadNonce) { stream.close(); return; }
         const d = JSON.parse(e.data);
         if (d.batch) {
+          const fresh = [];
           d.batch.forEach(item => {
             const key = `${item.channel_id}_${item.msg_id}`;
+            item.key = key;
             item.hay = `${item.filename || ''} ${item.caption || ''} ${item.date || ''} ${item.type || ''}`.toLowerCase();
-            items.set(key, item);
-            allMediaKeys.push(key);
-            cnt++;
+            if (!mediaRegistry.has(key)) {
+              mediaRegistry.set(key, item);
+              items.set(key, item);
+              allMediaKeys.push(key);
+              fresh.push(item);
+            }
           });
-          document.getElementById('sbar-txt').textContent = `${cnt} items loaded`;
-          updPillCounts();
-          if (vsRAF) cancelAnimationFrame(vsRAF);
-          vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
+          if (fresh.length > 0) {
+            cacheBatch(fresh);
+            allMediaKeys.sort((a, b) => (items.get(b).msg_id - items.get(a).msg_id));
+            sbarTxt.textContent = `${items.size} items live`;
+            updPillCounts();
+            requestAnimationFrame(() => applyFilters());
+          }
           return;
         }
         if (d.done) {
           stream.close(); stream = null;
-          document.getElementById('sbar-txt').textContent = `${cnt} items loaded`;
+          sbarTxt.textContent = `${items.size} items`;
           document.getElementById('pause-btn').style.display = 'none';
           document.getElementById('stop-btn').style.display = 'none';
           updPillCounts(); applyFilters(); return;
         }
-        if (d.error) { toast(d.error, 'err'); return; }
         const key = `${d.channel_id}_${d.msg_id}`;
-        items.set(key, d);
-        allMediaKeys.push(key);
-        cnt++;
-        if (cnt % 100 === 0) {
-          document.getElementById('sbar-txt').textContent = `Loading… ${cnt}`;
-          updPillCounts();
-          if (!paused) {
-            if (vsRAF) cancelAnimationFrame(vsRAF);
-            vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
+        if (!mediaRegistry.has(key)) {
+          d.key = key;
+          mediaRegistry.set(key, d);
+          items.set(key, d);
+          allMediaKeys.push(key);
+          cacheBatch([d]);
+          if (allMediaKeys.length % 50 === 0) {
+            allMediaKeys.sort((a, b) => (items.get(b).msg_id - items.get(a).msg_id));
+            applyFilters();
           }
         }
       };
-      stream.onerror = () => { if (stream) { stream.close(); stream = null; } document.getElementById('sbar-txt').textContent = `${cnt} items`; };
     };
 
     window.togglePause = () => {
@@ -864,7 +1060,7 @@ if (document.body.classList.contains('idx-page')) {
       return el;
     }
 
-    const THUMB_CONCURRENCY = 8;
+    const THUMB_CONCURRENCY = 16; // Increased concurrency
     let thumbActive = 0;
     const thumbQueue = [];
 
@@ -876,35 +1072,71 @@ if (document.body.classList.contains('idx-page')) {
       }
     }
 
-    function loadThumb(cardEl, item) {
+    async function loadThumb(cardEl, item) {
       if (!item) return;
+      const key = `${item.channel_id}_${item.msg_id}`;
+      
+      // ── Try Local Cache Header First ─────────────────────────────────────
+      const cachedBlob = await getThumb(key);
+      if (cachedBlob) {
+        const objectUrl = URL.createObjectURL(cachedBlob);
+        _applyThumb(cardEl, item, objectUrl, false); // false = don't re-cache
+        return;
+      }
+
+      // ── Network Fetch with High Priority ─────────────────────────────
       const url = `/api/thumb/${item.channel_id}/${item.msg_id}`;
       thumbQueue.push(() => new Promise(resolve => {
         const nth = cardEl.querySelector('.nth');
         if (!nth) { resolve(); return; }
-        if (item.type === 'video') {
-          const vid = document.createElement('video');
-          vid.poster = url; vid.muted = true; vid.loop = true;
-          vid.setAttribute('playsinline', '');
-          vid.className = 'card-vid';
-          nth.replaceWith(vid);
-          cardEl.style.setProperty('--bg-img', `url(${url})`);
-          let playT;
-          cardEl.onmouseenter = () => {
-            playT = setTimeout(() => {
-              if (!vid.src) { vid.src = `/api/preview/${item.channel_id}/${item.msg_id}`; vid.load(); }
-              vid.play().catch(() => {});
-            }, 400);
-          };
-          cardEl.onmouseleave = () => { clearTimeout(playT); vid.pause(); };
-          resolve(); return;
-        }
-        const img = new Image();
-        img.onload = () => { cardEl.style.setProperty('--bg-img', `url(${url})`); nth.replaceWith(img); resolve(); };
-        img.onerror = () => resolve();
-        img.src = url;
+
+        fetch(url, { priority: 'high' }).then(r => r.blob()).then(blob => {
+          if (blob.size < 100) throw new Error('Empty thumb');
+          storeThumb(key, blob);
+          const objectUrl = URL.createObjectURL(blob);
+          _applyThumb(cardEl, item, objectUrl, true);
+          resolve();
+        }).catch(err => {
+          resolve();
+        });
       }));
       drainThumbQueue();
+    }
+
+    function _applyThumb(cardEl, item, url, isNew) {
+      const nth = cardEl.querySelector('.nth');
+      if (item.type === 'video') {
+        const vid = document.createElement('video');
+        vid.poster = url; vid.muted = true; vid.loop = true;
+        vid.setAttribute('playsinline', '');
+        vid.className = 'card-vid';
+        if (nth) nth.replaceWith(vid);
+        else {
+          const oldVid = cardEl.querySelector('.card-vid');
+          if (oldVid) oldVid.poster = url;
+        }
+        cardEl.style.setProperty('--bg-img', `url(${url})`);
+        
+        cardEl.onmouseenter = () => {
+          if (!vid.src) { 
+            vid.src = `/api/preview/${item.channel_id}/${item.msg_id}`; 
+            vid.load(); 
+          }
+          vid.play().catch(() => {});
+        };
+        cardEl.onmouseleave = () => { vid.pause(); };
+      } else {
+        const img = new Image();
+        img.onload = () => { 
+          cardEl.style.setProperty('--bg-img', `url(${url})`); 
+          if (nth) nth.replaceWith(img);
+          else {
+            const oldImg = cardEl.querySelector('img');
+            if (oldImg) oldImg.src = url;
+          }
+        };
+        img.src = url;
+      }
     }
 
     function toggleSel(key, el, e) {
@@ -1117,11 +1349,49 @@ if (document.body.classList.contains('idx-page')) {
       document.querySelectorAll('.pitem, .ext-item').forEach(el => { if (!el.textContent.includes('✅') && !el.textContent.includes('🚫')) { const st = el.querySelector('.ext-status') || el.querySelector('.pm span'); if (st) st.textContent = 'Cancelling…'; } });
       toast(`Requested cancellation for ${cancelled} jobs`, cancelled > 0 ? 'warn' : '');
     };
+    window.toggleActivity = () => {
+      document.querySelector('.ws').classList.toggle('drawer-open');
+    };
+    window.toggleSidebar = () => {
+      document.querySelector('.ws').classList.toggle('sidebar-closed');
+      setTimeout(updViewport, 350);
+    };
+    window.closeDr = () => document.querySelector('.ws').classList.remove('drawer-open');
     window.resetActivity = async () => {
       if (!confirm('🛑 WARNING: This will permanently stop ALL active sync rules and CLEAR all activity history. Continue?')) return;
       try { await api('/api/jobs/reset', { method: 'POST' }); toast('All activity and logs cleared', 'ok'); document.getElementById('plist').innerHTML = ''; document.getElementById('mir-history').innerHTML = ''; document.getElementById('mir-syncs').innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>'; addMirrorCard('sync_activity', 'Live', 'Sync', 'Running'); } catch (e) { toast(e.message, 'err'); }
     };
-    window.closeDr = () => document.getElementById('pdrawer').classList.remove('open');
+
+    window.loadGlobalGallery = async () => {
+      if (stream) { stream.close(); stream = null; }
+      items.clear();
+      mediaRegistry.clear();
+      selItems.clear();
+      allMediaKeys = [];
+      filteredKeys = [];
+      const mgrid = document.getElementById('mgrid');
+      mgrid.innerHTML = '';
+      mgrid.style.display = 'grid';
+      document.getElementById('empty').style.display = 'none';
+      const sbar = document.getElementById('sbar');
+      sbar.style.display = 'flex';
+      document.getElementById('sbar-txt').textContent = 'Loading Global Media Library...';
+      try {
+        const data = await api('/api/gallery-data?limit=10000');
+        data.forEach(it => {
+          const key = `${it.channel_id}_${it.msg_id}`;
+          mediaRegistry.set(key, it);
+          items.set(key, it); 
+          allMediaKeys.push(key);
+        });
+        filteredKeys = [...allMediaKeys];
+        currentSearch = '';
+        currentSort = '';
+        document.getElementById('sbar-txt').textContent = `Showing all ${allMediaKeys.length} items from cache`;
+        renderVirtual(true);
+        updViewport();
+      } catch (e) { toast(e.message, 'err'); }
+    };
 
     window.doYtdlp = async () => {
       const url = document.getElementById('ext-url').value.trim();

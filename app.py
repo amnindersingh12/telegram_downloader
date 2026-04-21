@@ -179,6 +179,19 @@ async def get_health():
         "jobs": len(st.jobs)
     }
 
+@app.post("/api/cache/wipe")
+async def wipe_cache():
+    """Clear all cached media and entities to allow a clean re-scan."""
+    def _wipe():
+        with _db_connect() as c:
+            c.execute("DELETE FROM media")
+            c.execute("DELETE FROM entities")
+            c.execute("DELETE FROM channels")
+    await _db_run(_wipe)
+    # Also clear in-memory state
+    st.entity_cache.clear()
+    return {"status": "ok", "message": "Cache wiped. Please refresh and re-scan."}
+
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
     if not st.client:
@@ -348,6 +361,14 @@ async def get_media(
 
 @app.get("/api/thumb/{channel_id}/{msg_id}")
 async def get_thumb(channel_id: int, msg_id: int):
+    # Priority: return instantly if on disk
+    key = f"{channel_id}_{msg_id}"
+    t_path = THUMBS_DIR / f"{key}.jpg"
+    if t_path.exists():
+        return FileResponse(t_path, media_type="image/jpeg", 
+                           headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    
+    # Otherwise fetch (high priority)
     thumb_bytes = await _fetch_thumb(channel_id, msg_id)
     if thumb_bytes:
         return Response(thumb_bytes, media_type="image/jpeg", 
