@@ -17,7 +17,7 @@ if (document.body.classList.contains('idx-page')) {
     let renderBuf = [];
     let cardIdx = 0;
     let viewMode = 'gallery';
-    const gap = 12;
+    const gap = 24;
 
     // ── IndexedDB Caching ────────────────────────────────────────────────
     const DB_NAME = 'tgrab_cache';
@@ -262,24 +262,6 @@ if (document.body.classList.contains('idx-page')) {
       updViewport();
       startLiveUpdates();
       initHoverPreview();
-      startPerformanceMonitoring();
-    }
-
-    function startPerformanceMonitoring() {
-      setInterval(async () => {
-        try {
-          const d = await api('/api/health');
-          const el = document.getElementById('q-status');
-          if (el) {
-            if (d.thumb_queue > 0) {
-              el.textContent = `⚡ Prefetching ${d.thumb_queue} thumbs...`;
-              el.style.display = 'block';
-            } else {
-              el.style.display = 'none';
-            }
-          }
-        } catch {}
-      }, 5000);
     }
 
     function initHoverPreview() {
@@ -402,7 +384,85 @@ if (document.body.classList.contains('idx-page')) {
         tp.style.left = (rect.left + 50) + 'px';
         tp.style.top = (rect.top + 50) + 'px';
       };
+
+      // Command Palette Logic
+      let cpIdx = -1;
+      let cpFiltered = [];
+
+      window.toggleCP = (e) => {
+        if (e) e.preventDefault();
+        const overlay = document.getElementById('cp-overlay');
+        const input = document.getElementById('cp-input');
+        overlay.classList.add('active');
+        input.value = '';
+        input.focus();
+        searchCP('');
+      };
+
+      window.closeCP = () => {
+        document.getElementById('cp-overlay').classList.remove('active');
+      };
+
+      window.searchCP = (q) => {
+        const results = document.getElementById('cp-results');
+        q = q.toLowerCase();
+        
+        const commands = [
+          { text: 'View Photos', icon: '📷', type: 'Category', action: () => setFilter('photo') },
+          { text: 'View Videos', icon: '🎬', type: 'Category', action: () => setFilter('video') },
+          { text: 'View Documents', icon: '📄', type: 'Category', action: () => setFilter('document') },
+          { text: 'View All Media', icon: '🖼️', type: 'Category', action: () => setFilter('all') },
+          { text: 'Wipe Cache', icon: '🧹', type: 'System', action: () => { if(confirm('Wipe cache?')) wipeCache(); } }
+        ];
+
+        const chs = allChs.map(c => ({ text: c.title, icon: '📡', type: 'Channel', action: () => { switchSTab('channels'); selectChannel(c.id); } }));
+        
+        cpFiltered = [...commands, ...chs].filter(item => 
+          item.text.toLowerCase().includes(q) || item.type.toLowerCase().includes(q)
+        ).slice(0, 15);
+
+        cpIdx = 0;
+        renderCP();
+      };
+
+      function renderCP() {
+        const box = document.getElementById('cp-results');
+        box.innerHTML = cpFiltered.map((it, i) => `
+          <div class="cp-item ${i === cpIdx ? 'active' : ''}" onclick="execCP(${i})">
+            <span class="cp-item-icon">${it.icon}</span>
+            <span class="cp-item-text">${esc(it.text)}</span>
+            <span class="cp-item-type">${it.type}</span>
+          </div>
+        `).join('');
+        const active = box.querySelector('.cp-item.active');
+        if (active) active.scrollIntoView({ block: 'nearest' });
+      }
+
+      window.execCP = (i) => {
+        const it = cpFiltered[i];
+        if (it) {
+          it.action();
+          closeCP();
+        }
+      };
+
+      document.addEventListener('keydown', e => {
+        if (document.getElementById('cp-overlay').classList.contains('active')) {
+          if (e.key === 'ArrowDown') { e.preventDefault(); cpIdx = (cpIdx + 1) % cpFiltered.length; renderCP(); }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); cpIdx = (cpIdx - 1 + cpFiltered.length) % cpFiltered.length; renderCP(); }
+          else if (e.key === 'Enter') { e.preventDefault(); execCP(cpIdx); }
+          else if (e.key === 'Escape') { e.preventDefault(); closeCP(); }
+          return;
+        }
+
+        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+          toggleCP(e);
+        }
+      });
+
+      document.getElementById('cp-input')?.addEventListener('input', (e) => searchCP(e.target.value));
     }
+
 
     function startLiveUpdates() {
       if (window.updateES) window.updateES.close();
@@ -444,24 +504,50 @@ if (document.body.classList.contains('idx-page')) {
         el = document.createElement('div');
         el.id = 'folder-tabs';
         el.className = 'ftabs';
+        el.style.alignItems = 'center'; // Align with dropdown
         parent.insertBefore(el, ss);
       }
       
       const hasUnreadTab = folders.some(f => f.name.toLowerCase() === 'unread');
-      const tabs = [
-        {name: '', emoji: '🏠', label: 'All'}
-      ];
+      const tabs = [{name: '', emoji: '🏠', label: 'All'}];
       
-      // Only add virtual unread if user doesn't have an official one
       if (!hasUnreadTab) {
         tabs.push({name: 'unread_virtual', emoji: '🔔', label: 'Unread'});
+      } else {
+        // Move unread to front if it's in folders
+        const idx = folders.findIndex(f => f.name.toLowerCase() === 'unread');
+        if (idx > -1) {
+          const f = folders.splice(idx, 1)[0];
+          tabs.push({...f, label: (f.emoji ? f.emoji + ' ' : '') + f.name});
+        }
       }
-      
-      folders.forEach(f => tabs.push({...f, label: (f.emoji ? f.emoji + ' ' : '') + f.name}));
-      
-      el.innerHTML = tabs.map(t =>
+
+      // Primary view
+      let html = tabs.map(t =>
         `<button class="ftab${t.name === activeFolder ? ' active' : ''}" onclick="setFolder('${esc(t.name)}')">${esc(t.label)}</button>`
       ).join('');
+
+      // Dropdown for the rest
+      if (folders.length > 0) {
+        const isSecondarySelected = folders.some(f => f.name === activeFolder);
+        html += `
+          <div class="folder-dropdown">
+            <select class="ftab ${isSecondarySelected ? 'active' : ''}" 
+                    style="appearance:none; border:none; padding-right:24px; position:relative"
+                    onchange="setFolder(this.value)">
+              <option value="" disabled ${!isSecondarySelected ? 'selected' : ''}>📁 Categories...</option>
+              ${folders.map(f => `
+                <option value="${esc(f.name)}" ${f.name === activeFolder ? 'selected' : ''}>
+                  ${f.emoji ? f.emoji + ' ' : ''}${esc(f.name)}
+                </option>
+              `).join('')}
+            </select>
+            <div style="position:absolute; right:10px; top:50%; transform:translateY(-50%); pointer-events:none; font-size:8px; opacity:0.5">▼</div>
+          </div>
+        `;
+      }
+      
+      el.innerHTML = html;
     }
 
     window.setFolder = name => {
@@ -538,28 +624,28 @@ if (document.body.classList.contains('idx-page')) {
       div.className = 'ch' + (sel ? ' sel' : '');
       div.dataset.id = ch.id;
       div.onclick = (e) => toggleCh(ch.id, div, e);
-      div.onmouseenter = () => {
-        // Predictive pre-render: populate items from registry while hovering
-        if (!selChs.has(ch.id)) {
-          const cached = [];
-          mediaRegistry.forEach(it => { if (it.channel_id === ch.id) cached.push(it); });
-          if (cached.length > 0) console.log(`Pre-warmed ${cached.length} items for ${ch.title}`);
-        }
-      };
-
-      const mem = ch.members
-        ? `${ch.members > 999 ? (ch.members / 1000).toFixed(1) + 'k' : ch.members} members`
-        : ch.type;
+      
+      const memCount = ch.members > 999 ? (ch.members / 1000).toFixed(1) + 'k' : (ch.members || 0);
+      const memHtml = ch.members 
+        ? `<span class="mem-icon">👤</span><span class="mem-count">${memCount}</span>`
+        : `<span class="mem-type">${ch.type}</span>`;
+      
       const folderBadge = ch.folders?.length
         ? `<span class="ch-folder">${esc(ch.folders[0])}</span>` : '';
       
       const unreadIndicator = ch.unread > 0 
-        ? `<div class="ch-dot ${ch.pulsing ? 'pulse' : ''}"></div>` 
+        ? `<div class="ch-unread ${ch.pulsing ? 'pulse' : ''}">${ch.unread}</div>` 
         : '';
 
       div.innerHTML = `
-        <div class="av" style="background:${color}15;color:${color}">${ch.title.charAt(0).toUpperCase()}</div>
-        <div class="ci"><div class="cn">${esc(ch.title)}</div><div class="cm">${mem} ${folderBadge}</div></div>
+        <div class="av" style="background:${color}15;color:${color}">
+          ${ch.title.charAt(0).toUpperCase()}
+          <div class="mem-badge">${memCount}</div>
+        </div>
+        <div class="ci">
+          <div class="cn">${esc(ch.title)}</div>
+          <div class="cm">${memHtml} ${folderBadge}</div>
+        </div>
         <div class="cr">${unreadIndicator}<div class="ck">${sel ? chk() : ''}</div></div>`;
       list.appendChild(div);
     }
@@ -637,10 +723,15 @@ if (document.body.classList.contains('idx-page')) {
       const allSel = visible.length > 0 && visible.every(c => selChs.has(c.id));
       btn.textContent = allSel ? 'Deselect All' : 'Select All';
 
-      const sf = document.querySelector('.sf');
+      const sf = document.getElementById('ch-actions');
       if (sf) {
-        if (selChs.size > 0) sf.classList.add('active');
-        else sf.classList.remove('active');
+        if (selChs.size > 0) {
+          sf.classList.add('active');
+          const countEl = document.getElementById('vmbtn-count');
+          if (countEl) countEl.textContent = selChs.size;
+        } else {
+          sf.classList.remove('active');
+        }
       }
       updSelCount();
     }
@@ -651,13 +742,14 @@ if (document.body.classList.contains('idx-page')) {
         counts.all++;
         if (counts[item.type] !== undefined) counts[item.type]++;
       }
-      const labels = { all: 'All', photo: '📷 Photos', video: '🎬 Videos', document: '📄 Docs' };
-      document.querySelectorAll('.pill').forEach(pill => {
-        const f = pill.getAttribute('onclick')?.match(/'(\w+)'/)?.[1];
-        if (f && counts[f] !== undefined) {
-          pill.textContent = counts[f] > 0 ? `${labels[f]} ${counts[f].toLocaleString()}` : labels[f];
-        }
-      });
+      
+      const select = document.getElementById('mfilter');
+      if (select) {
+        select.options[0].textContent = counts.all > 0 ? `All Media (${counts.all.toLocaleString()})` : 'All Media';
+        select.options[1].textContent = counts.photo > 0 ? `📷 Photos (${counts.photo.toLocaleString()})` : '📷 Photos';
+        select.options[2].textContent = counts.video > 0 ? `🎬 Videos (${counts.video.toLocaleString()})` : '🎬 Videos';
+        select.options[3].textContent = counts.document > 0 ? `📄 Documents (${counts.document.toLocaleString()})` : '📄 Documents';
+      }
     }
 
     window.filterChs = q => {
@@ -666,10 +758,12 @@ if (document.body.classList.contains('idx-page')) {
 
     window.switchSTab = (name, el) => {
       document.querySelectorAll('.stab').forEach(t => t.classList.remove('active'));
-      el.classList.add('active');
+      if (el) el.classList.add('active');
       document.querySelectorAll('.sidebar .sidebar-pane').forEach(p => p.classList.remove('active'));
       document.getElementById('sp-' + name)?.classList.add('active');
       if (name === 'channels' || name === 'gallery') updViewport();
+      // On mobile, hide the sidebar after selecting a tab
+      document.querySelector('.sidebar')?.classList.remove('m-active');
     };
 
     // ── Virtual Scroller State ──────────────────────────────────────────────
@@ -699,8 +793,12 @@ if (document.body.classList.contains('idx-page')) {
         return;
       }
 
-      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
-      columns = Math.floor((grid.clientWidth - 24) / rowH) || 1;
+      const desiredWidth = 320;
+      columns = Math.floor((grid.clientWidth - 24) / desiredWidth) || 1;
+      const totalGapWidth = (columns - 1) * gap;
+      const itemWidth = (grid.clientWidth - 24 - totalGapWidth) / columns;
+      const rowH = (itemWidth * 9 / 16) + gap; 
+
       const totalRows = Math.ceil(filteredKeys.length / columns);
       const totalH = totalRows * rowH;
 
@@ -755,9 +853,6 @@ if (document.body.classList.contains('idx-page')) {
         const row = Math.floor(globalIdx / columns);
         const col = globalIdx % columns;
         el.style.position = 'absolute';
-        
-        const totalGapWidth = (columns - 1) * gap;
-        const itemWidth = (grid.clientWidth - 24 - totalGapWidth) / columns;
         
         el.style.width = itemWidth + 'px';
         el.style.height = (rowH - gap) + 'px';
@@ -851,10 +946,14 @@ if (document.body.classList.contains('idx-page')) {
     window.addEventListener('resize', updViewport);
 
     // ── Media loading ───────────────────────────────────────────────────────
-    window.setFilter = (f, el) => {
-      filter = f;
+    window.setFilter = (val, el) => {
+      filter = val;
+      const select = document.getElementById('mfilter');
+      if (select) select.value = val;
+      
       document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
-      el.classList.add('active');
+      if (el) el.classList.add('active');
+      
       applyFilters();
       if (!allMediaKeys.length && selChs.size) loadMedia();
     };
@@ -914,7 +1013,11 @@ if (document.body.classList.contains('idx-page')) {
 
     let loadNonce = 0;
     window.loadMedia = async () => {
+      lbClose(); // Close lightbox if open
+      hideTruePreview(); // Close spacebar preview if open
       const nonce = ++loadNonce;
+
+
       if (!selChs.size) {
         items.clear(); allMediaKeys = [];
         document.getElementById('mgrid').innerHTML = '';
@@ -926,13 +1029,14 @@ if (document.body.classList.contains('idx-page')) {
       // But for "truly fast" we just rebuild the keys in RAM.
       allMediaKeys = []; 
       items.clear(); 
-
+      applyFilters(); // Instant UI clear
+      
       const grid = document.getElementById('mgrid');
       if (grid) {
         grid.style.display = 'block';
-        // Optimization: don't wipe grid if we have many items, virtual scroller will handle it
       }
       document.getElementById('empty').style.display = 'none';
+
       document.getElementById('sbar').classList.add('active');
       document.getElementById('pause-btn').style.display = 'block';
       document.getElementById('stop-btn').style.display = 'block';
@@ -955,9 +1059,12 @@ if (document.body.classList.contains('idx-page')) {
           return (ib.msg_id - ia.msg_id);
         });
         sbarTxt.textContent = `${items.size} items (instant)`;
-        updPillCounts();
-        applyFilters();
+      } else {
+        sbarTxt.textContent = 'Waiting for stream...';
       }
+      updPillCounts();
+      applyFilters();
+
 
       if (stream) { stream.close(); stream = null; }
       const ids = chIds.join(',');
@@ -1029,8 +1136,9 @@ if (document.body.classList.contains('idx-page')) {
 
     function makeCard(key, item) {
       const sel = selItems.has(key);
+      const isDoc = item.type === 'document';
       const el = document.createElement('div');
-      el.className = 'mc' + (sel ? ' sel' : '');
+      el.className = 'mc' + (sel ? ' sel' : '') + (isDoc ? ' mc-doc' : '');
       el.dataset.key = key;
       el.onclick = (e) => {
         if (e.target.closest('.mchk')) {
@@ -1046,17 +1154,24 @@ if (document.body.classList.contains('idx-page')) {
       el.onmouseleave = () => hideTruePreview();
       el.onmousemove = (e) => moveTruePreview(e);
       el.ondblclick = ev => { ev.stopPropagation(); openPreview(key); };
-      const ti = { photo: '🖼️', video: '🎬', document: '📄' }[item.type] || '❓';
+
+      const icon = { photo: '🖼️', video: '🎬', document: '📄' }[item.type] || '❓';
       const cap = item.caption || '';
+      
       el.innerHTML = `
-        <div class="nth"><div class="ti">${ti}</div>
-          <div style="font-size:9px;padding:0 6px;text-align:center">${esc(item.filename)}</div></div>
-        <div class="mchk">${chk()}</div>
-        <div class="tbadge ${item.type.charAt(0)}">${item.type.toUpperCase()}</div>
-        <div class="minfo"><div class="mfn">${esc(item.filename)}</div>
-          <div class="msz">${item.size_readable || hrSize(item.size)}</div></div>
-        <div class="mpreview">🔍</div>
-        ${cap ? `<div class="mcap">${esc(cap.slice(0, 120))}</div>` : ''}`;
+        <div class="m-thumb-area">
+          <div class="nth">
+            <div class="ti">${icon}</div>
+          </div>
+          <div class="mchk">${chk()}</div>
+          <div class="tbadge ${item.type.charAt(0)}">${item.type.toUpperCase()}</div>
+          <div class="mpreview">🔍</div>
+          ${cap ? `<div class="mcap" title="${esc(cap)}">${esc(cap.slice(0, 200))}</div>` : ''}
+        </div>
+        <div class="m-details">
+          <div class="mfn" title="${esc(item.filename)}">${esc(item.filename)}</div>
+          <div class="msz">${item.size_readable || hrSize(item.size)}</div>
+        </div>`;
       return el;
     }
 
@@ -1073,7 +1188,7 @@ if (document.body.classList.contains('idx-page')) {
     }
 
     async function loadThumb(cardEl, item) {
-      if (!item) return;
+      if (!item || item.type === 'document') return;
       const key = `${item.channel_id}_${item.msg_id}`;
       
       // ── Try Local Cache Header First ─────────────────────────────────────
@@ -1165,13 +1280,15 @@ if (document.body.classList.contains('idx-page')) {
       const el = document.getElementById('selc');
       if (el) el.textContent = n;
       const bb = document.querySelector('.bb');
-      const sf = document.querySelector('.sf');
+      const sf = document.querySelector('.floating-cta');
       if (bb) {
         if (n > 0) {
           bb.classList.add('active');
           if (sf && sf.classList.contains('active')) bb.classList.add('shifted');
           else bb.classList.remove('shifted');
-        } else { bb.classList.remove('active', 'shifted'); }
+        } else {
+          bb.classList.remove('active', 'shifted');
+        }
       }
       let totalSize = 0;
       selItems.forEach(k => { const it = items.get(k); if (it) totalSize += it.size || 0; });
@@ -1203,10 +1320,12 @@ if (document.body.classList.contains('idx-page')) {
       lbIdx = filteredKeys.indexOf(key);
       if (lbIdx === -1) return;
       lb.classList.add('open');
-      document.body.style.overflow = 'hidden';
+      document.body.classList.add('lb-active');
       lbLoad(lbIdx, 0);
     }
-    function lbClose() { lb.classList.remove('open'); document.body.style.overflow = ''; _lbCleanup(); }
+
+    function lbClose() { lb.classList.remove('open'); document.body.classList.remove('lb-active'); _lbCleanup(); }
+
     function _lbCleanup() { if (lbActiveMedia) { lbActiveMedia.pause?.(); lbActiveMedia.src = ''; lbActiveMedia = null; } }
     async function _buildMedia(item) {
       const url = `/api/preview/${item.channel_id}/${item.msg_id}`;
@@ -1229,11 +1348,23 @@ if (document.body.classList.contains('idx-page')) {
       const item = items.get(key);
       if (!item) { lbNavigating = false; return; }
       lbInfo.textContent = `${item.filename}  ·  ${item.size_readable || hrSize(item.size)}  ·  ${idx + 1} / ${filteredKeys.length}`;
+      
+      const bloom = document.getElementById('lb-bloom');
+      if (bloom) bloom.innerHTML = '';
+
       if (dir === 0 || !lbCnt.firstChild) {
         lbCnt.innerHTML = '<div class="lb-spinner"></div>';
         const el = await _buildMedia(item);
         if (item.type === 'video') lbActiveMedia = el;
         lbCnt.innerHTML = ''; lbCnt.appendChild(el);
+        
+        // Update Bloom
+        if (bloom) {
+          const bl = el.cloneNode();
+          if (item.type === 'video') { bl.muted = true; bl.autoplay = true; bl.loop = true; bl.controls = false; }
+          bloom.appendChild(bl);
+        }
+
         el.style.animation = 'lb-fadein 0.3s ease both';
         lbNavigating = false; _preload(idx+1); _preload(idx-1); return;
       }
@@ -1243,9 +1374,18 @@ if (document.body.classList.contains('idx-page')) {
       const [el] = await Promise.all([_buildMedia(item), new Promise(r => setTimeout(r, SLIDE_DUR * 0.35))]);
       _lbCleanup(); if (item.type === 'video') lbActiveMedia = el;
       lbCnt.innerHTML = ''; lbCnt.appendChild(el);
+
+      // Update Bloom
+      if (bloom) {
+        const bl = el.cloneNode();
+        if (item.type === 'video') { bl.muted = true; bl.autoplay = true; bl.loop = true; bl.controls = false; }
+        bloom.appendChild(bl);
+      }
+
       el.style.animation = `lb-slide-in-${dir > 0 ? 'right' : 'left'} ${SLIDE_DUR}ms cubic-bezier(0.4,0,0.2,1) both`;
       lbNavigating = false; _preload(idx+1); _preload(idx-1);
     }
+
     function _preload(idx) {
       const k = filteredKeys[idx]; if (!k) return;
       const it = items.get(k); if (!it || it.type === 'video') return;
@@ -1316,7 +1456,23 @@ if (document.body.classList.contains('idx-page')) {
       document.getElementById('pdrawer').classList.add('open');
       const card = document.createElement('div');
       card.className = 'pitem'; card.id = `j-${job_id}`;
-      card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div><button class="vbtn" style="width:auto;padding:3px 8px;font-size:10px;border-radius:6px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1)" onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div><div class="pm"><span id="pc-${job_id}">Queued…</span><span id="pp-${job_id}">0%</span></div><div id="logs-${job_id}" class="m-logs" style="display:none"></div><div class="perr" id="pe-${job_id}" style="display:none"></div><button class="pcancel" onclick="cancelJob('${job_id}')">Cancel</button>`;
+      card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div><button class="vbtn" style="width:auto;padding:3px 8px;font-.status-pill.active { color: var(--ok); background: rgba(48, 209, 88, 0.1); border-color: rgba(48, 209, 88, 0.2); }
+
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.2);
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+.conn-dot.active {
+  background: var(--ok);
+  box-shadow: 0 0 10px rgba(48, 209, 88, 0.4);
+}
+onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div><div class="pm"><span id="pc-${job_id}">Queued…</span><span id="pp-${job_id}">0%</span></div><div id="logs-${job_id}" class="m-logs" style="display:none"></div><div class="perr" id="pe-${job_id}" style="display:none"></div><button class="pcancel" onclick="cancelJob('${job_id}')">Cancel</button>`;
       document.getElementById('plist').prepend(card);
       const es = new EventSource(`/api/download/${job_id}/progress`);
       es.onmessage = e => {
@@ -1353,8 +1509,13 @@ if (document.body.classList.contains('idx-page')) {
       document.querySelector('.ws').classList.toggle('drawer-open');
     };
     window.toggleSidebar = () => {
-      document.querySelector('.ws').classList.toggle('sidebar-closed');
-      setTimeout(updViewport, 350);
+      const ws = document.querySelector('.ws');
+      const sb = document.querySelector('.sidebar');
+      const icon = document.getElementById('sb-toggle-icon');
+      ws.classList.toggle('sidebar-collapsed');
+      const isCollapsed = sb.classList.toggle('collapsed');
+      if (icon) icon.style.transform = isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)';
+      setTimeout(updViewport, 450);
     };
     window.closeDr = () => document.querySelector('.ws').classList.remove('drawer-open');
     window.resetActivity = async () => {
@@ -1570,15 +1731,28 @@ if (document.body.classList.contains('idx-page')) {
       const lb = document.getElementById('lb'); const isLb = lb.classList.contains('active') || lb.classList.contains('open');
       if (isLb) { if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); lbNav(-1); return; } if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); lbNav(1); return; } return; }
       if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) { e.preventDefault(); peekByKeys(e.key.replace('Arrow', '').toLowerCase(), e); return; }
-      if (e.key === ' ') { e.preventDefault(); const key = filteredKeys[peekIdx]; if (key) toggleSel(key, document.querySelector(`.mc[data-key="${key}"]`), e); }
+      if (e.key === ' ') { e.preventDefault(); const key = filteredKeys[peekIdx]; if (key) openPreview(key); }
       if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) { const key = filteredKeys[peekIdx]; if (key) openPreview(key); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'a') { e.preventDefault(); selAll(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { if (selItems.size) doDl(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); toggleCP(); }
     });
+
     document.getElementById('msearch')?.addEventListener('input', debounce(e => searchMedia(e.target.value), 250));
+
     function showErr(id, m) { const el = document.getElementById(id); el.textContent = m; el.style.display = 'block'; }
     function hideErr(id) { document.getElementById(id).style.display = 'none'; }
 
-    (async () => { try { const r = await api('/api/auth/status'); if (r.authenticated) { sv('vapp'); initApp(); } else sv('va'); } catch { sv('va'); } })();
+    (async () => {
+      try {
+        const r = await api('/api/auth/status');
+        if (r.authenticated) { sv('vapp'); initApp(); }
+        else sv('va');
+        if (window.lucide) lucide.createIcons();
+      } catch {
+        sv('va');
+      }
+    })();
+
   })();
 }

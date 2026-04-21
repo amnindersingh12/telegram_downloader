@@ -7,7 +7,9 @@
   <title>TGrab — Telegram Media Downloader</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css?v=6">
+  <script src="https://unpkg.com/lucide@latest"></script>
 </head>
+
 
 <body class="idx-page">
 
@@ -61,46 +63,66 @@
   <div id="vapp" class="view">
     <div class="topbar">
       <div class="logo" style="margin:0; gap:10px">
-        <div class="logo-icon" style="width:28px; height:28px; font-size:14px; border-radius:8px">📡</div>
+        <div class="logo-icon" style="width:28px; height:28px; font-size:14px; border-radius:8px; background:var(--accent); color:#fff">
+          <i data-lucide="radio"></i>
+        </div>
         <div class="logo-text" style="font-size:16px; letter-spacing:-0.5px">TGrab</div>
       </div>
-      
+
+
       <div style="width:1px; height:20px; background:var(--border); margin:0 8px"></div>
 
       <button class="status-pill" onclick="toggleSidebar()" title="Toggle Sidebar">
-        <span>📁</span> Sidebar
+        <i data-lucide="chevron-left" id="sb-toggle-icon" style="width:16px; height:16px; transition: transform 0.3s"></i>
       </button>
+
+
 
       <div class="tsp"></div>
 
-      <div class="status-pill active" id="conn-status" style="gap:12px">
-        <div style="display:flex; align-items:center; gap:5px">
-          <span style="width:6px; height:6px; background:var(--ok); border-radius:50%"></span>
-          Connected
+      <!-- Centered Main Controls -->
+      <div class="header-controls">
+        <div class="search-wrap">
+          <i data-lucide="search" class="search-icon"></i>
+          <input type="text" id="msearch" placeholder="Search library...">
         </div>
-        <div id="q-status" style="display:none; font-size:10px; color:var(--accent); font-weight:600; border-left:1px solid var(--border); padding-left:10px">⚡ Prefetching...</div>
+        
+        <div class="filter-controls">
+          <select class="mfilter-dropdown" id="mfilter" onchange="setFilter(this.value)">
+            <option value="all">Everything</option>
+            <option value="photo">Photos</option>
+            <option value="video">Videos</option>
+            <option value="document">Docs</option>
+          </select>
+        </div>
+
       </div>
 
-      <button class="status-pill" onclick="toggleActivity()" title="Terminal & Activity" style="width:36px; height:36px; padding:0; justify-content:center; border-radius:50%">
-        <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none" style="opacity:0.8">
-          <polyline points="4 17 10 11 4 5"></polyline>
-          <line x1="12" y1="19" x2="20" y2="19"></line>
-        </svg>
+
+      <div class="tsp"></div>
+
+      <button class="status-pill" onclick="toggleActivity()" title="Terminal & Activity"
+        style="width:32px; height:32px; padding:0; justify-content:center; border-radius:50%">
+        <i data-lucide="terminal" style="width:14px; height:14px; opacity:0.8"></i>
       </button>
 
-      <button class="status-pill" onclick="doLogout()" style="color:var(--err); border-radius:30px">
-        Logout
+      <button class="logout-btn" onclick="doLogout()" title="Logout">
+        <i data-lucide="log-out"></i>
       </button>
+
+
+      <div class="conn-dot active" id="conn-status" title="Connected"></div>
     </div>
 
     <div class="ws">
       <div class="sidebar" style="position:relative">
         <div class="stabs">
-          <div class="stab active" onclick="switchSTab('channels',this)" title="Channels">📡</div>
-          <div class="stab" onclick="switchSTab('gallery',this)" title="Gallery">🖼️</div>
-          <div class="stab" onclick="switchSTab('external',this)" title="External">🌐</div>
-          <div class="stab" onclick="switchSTab('mirror',this)" title="Mirror">👯</div>
+          <div class="stab active" onclick="switchSTab('channels',this)" title="Channels"><i data-lucide="radio"></i></div>
+          <div class="stab" onclick="switchSTab('gallery',this)" title="Gallery"><i data-lucide="image"></i></div>
+          <div class="stab" onclick="switchSTab('external',this)" title="External"><i data-lucide="globe"></i></div>
+          <div class="stab" onclick="switchSTab('mirror',this)" title="Mirror"><i data-lucide="copy"></i></div>
         </div>
+
 
         <!-- Channels pane -->
         <div class="sidebar-pane active" id="sp-channels">
@@ -117,29 +139,37 @@
               <div class="sk" style="height:56px"></div>
             </div>
           </div>
-          <div class="sf">
-            <button class="vbtn" id="vmbtn" disabled style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">0 selected</button>
-            <button class="vbtn" id="selall-ch" onclick="selAllChs()">Select All</button>
+
+          <!-- Sidebar Footer (Channel Actions) -->
+          <div class="sidebar-footer" id="ch-actions">
+            <div class="ch-actions-count"><b id="vmbtn-count">0</b> channels</div>
+            <div class="ch-actions-row">
+              <button class="vbtn primary" id="vmbtn" disabled onclick="loadMedia()">View</button>
+              <button class="vbtn" id="selall-ch" onclick="selAllChs()">All</button>
+            </div>
           </div>
+
         </div>
 
         <!-- Gallery pane -->
         <div class="sidebar-pane" id="sp-gallery" style="padding:15px">
           <div style="font-size:13px; font-weight:600; margin-bottom:12px; color:var(--text)">Gallery Settings</div>
-          
+
           <div class="f" style="margin-bottom:20px">
             <label style="font-size:10px; margin-bottom:10px">Grid Item Size</label>
             <div style="display:flex; align-items:center; gap:10px">
               <span style="font-size:12px; opacity:0.5">🔳</span>
-              <input type="range" id="grid-zoom" min="120" max="450" value="180" oninput="updGridSize(this.value)" style="flex:1">
+              <input type="range" id="grid-zoom" min="120" max="450" value="220" oninput="updGridSize(this.value)"
+                style="flex:1">
             </div>
           </div>
 
           <div style="font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:20px">
             Adjust the grid size and layout behavior. This applies to both the channel view and the global gallery.
           </div>
-          
-          <button class="btn btn-p" onclick="loadGlobalGallery()" style="margin-top:auto">View All Indexed Media</button>
+
+          <button class="btn btn-p" onclick="loadGlobalGallery()" style="margin-top:auto">View All Indexed
+            Media</button>
         </div>
 
         <!-- External pane -->
@@ -181,70 +211,51 @@
           <div class="ext-history" id="mir-history-v" style="padding:0 10px"></div>
         </div>
 
-        <div class="bb">
-          <div class="bbc"><b>0</b> selected</div>
-          <div class="tsp"></div>
-          <button class="ibox-btn" style="background:transparent;border-color:transparent;color:var(--muted);width:auto;padding:0 8px;font-size:11px" onclick="selItems.clear();updSelCount();renderVirtual()">✕</button>
-          <button class="dlbtn" id="dlbtn" disabled onclick="doDl()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-          </button>
-        </div>
       </div>
 
       <div class="gutter" id="gutter"></div>
       <!-- Main -->
       <div class="main">
-        <div class="toolbar">
-          <div class="t1">
-            <div class="pills">
-              <button class="pill active" onclick="setFilter('all',this)">All</button>
-              <button class="pill" onclick="setFilter('photo',this)">📷 Photos</button>
-              <button class="pill" onclick="setFilter('video',this)">🎬 Videos</button>
-            </div>
-
-            <div style="width:1px; height:16px; background:var(--border); margin:0 4px"></div>
-
-            <div class="search-wrap">
-              <span class="si">🔍</span>
-              <input type="text" id="msearch" placeholder="Search...">
-            </div>
-
-            <div style="width:1px; height:16px; background:var(--border); margin:0 4px"></div>
-
-            <div class="pills">
-              <button class="pill" id="selall-btn" onclick="selAll()" title="Select All Visible">
-                <span>✓</span>
-              </button>
-              <select class="sort" onchange="sortMedia(this.value)" style="background:transparent; border:none; width:80px; font-size:11px">
-                <option value="">Sort</option>
-                <option value="date-desc">Newest</option>
-                <option value="size-desc">Largest</option>
-              </select>
-            </div>
+        <div class="selection-pill" id="bb">
+          <div class="pill-count"><b id="sel-count">0</b> items marked</div>
+          <div class="pill-divider"></div>
+          <div class="pill-actions">
+            <button class="pill-btn primary" onclick="doDl()" title="Download Selected"><i data-lucide="download"></i></button>
+            <button class="pill-btn" onclick="toast('Move logic coming soon', 'info')" title="Move Selected"><i data-lucide="folder-output"></i></button>
+            <button class="pill-btn danger" onclick="toast('Delete logic coming soon', 'err')" title="Delete Selected"><i data-lucide="trash-2"></i></button>
+            <div class="pill-divider"></div>
+            <button class="pill-btn" onclick="selItems.clear();updSelCount();renderVirtual()" title="Clear Selection"><i data-lucide="x"></i></button>
           </div>
         </div>
 
+        <!-- Floating toolbar removed to clear real estate -->
+
+
         <!-- Stream status bar -->
-        <div class="stream-bar" id="sbar" style="height:32px; padding:0 20px; font-size:11px; margin-top:-6px; z-index:90">
+        <div class="stream-bar" id="sbar"
+          style="height:32px; padding:0 20px; font-size:11px; margin-top:-6px; z-index:90">
           <div class="sb-dot" style="width:6px; height:6px"></div>
           <span id="sbar-txt" style="opacity:0.8">Loading…</span>
           <div class="tsp2"></div>
-          <button class="pause-btn" id="pause-btn" onclick="togglePause()" style="font-size:10px; padding:2px 8px">⏸ Pause</button>
-          <button class="pause-btn" id="stop-btn" style="border-color:var(--err); color:var(--err); margin-left:5px; display:none; font-size:10px; padding:2px 8px" onclick="stopStream()">⏹ Stop</button>
+          <button class="pause-btn" id="pause-btn" onclick="togglePause()" style="font-size:10px; padding:2px 8px">⏸
+            Pause</button>
+          <button class="pause-btn" id="stop-btn"
+            style="border-color:var(--err); color:var(--err); margin-left:5px; display:none; font-size:10px; padding:2px 8px"
+            onclick="stopStream()">⏹ Stop</button>
         </div>
 
-        <!-- Empty / grid -->
         <div class="empty" id="empty">
-          <div class="empty-icon">📡</div>
+          <div class="empty-icon"><i data-lucide="radio" style="width:64px; height:64px"></i></div>
           <div style="font-size:14px;font-weight:500">No media loaded</div>
           <div style="font-size:12px;opacity:.6">Select channels and click "View Media"</div>
-          <div style="font-size:11px;opacity:.4;margin-top:4px">Tip: ⌘A to select all · ⌘↵ to download</div>
+          <div style="font-size:11px;opacity:.4;margin-top:4px">Tip: Ctrl + K for Command Palette · Ctrl + Enter to Download</div>
         </div>
+
         <div class="media-grid gallery-mode" id="mgrid" style="display:none"></div>
+
+        <!-- Floating Contextual Action Bar -->
+        <!-- Removed floating-cta to eliminate overlapping -->
+
       </div>
 
       <!-- Activity Panel (Rights Sidebar) -->
@@ -253,17 +264,21 @@
         <div class="dh">
           <span>📊</span><span class="dt">Activity & Logs</span>
           <div style="display:flex;gap:5px">
-            <button class="vbtn" style="width:auto;padding:3px 10px;font-size:10px;background:rgba(255,255,255,0.1);border:1px solid var(--border);border-radius:6px" onclick="cancelAllJobs()">Cancel All</button>
-            <button class="vbtn" style="width:auto;padding:3px 10px;font-size:10px;background:var(--err);border-radius:6px" onclick="resetActivity()">Reset & Clear All</button>
+            <button class="vbtn"
+              style="width:auto;padding:3px 10px;font-size:10px;background:rgba(255,255,255,0.1);border:1px solid var(--border);border-radius:6px"
+              onclick="cancelAllJobs()">Cancel All</button>
+            <button class="vbtn"
+              style="width:auto;padding:3px 10px;font-size:10px;background:var(--err);border-radius:6px"
+              onclick="resetActivity()">Reset & Clear All</button>
           </div>
         </div>
         <div class="sidebar-pane active" style="overflow-y:auto">
           <div class="s-section-header">Downloads</div>
           <div id="plist" style="padding:0 10px"></div>
-          
+
           <div class="s-section-header">Active Sync Rules</div>
           <div id="mir-syncs" style="padding:0 10px"></div>
-          
+
           <div class="s-section-header">Mirroring Status</div>
           <div class="ext-history" id="mir-history" style="padding:0 10px"></div>
         </div>
@@ -293,11 +308,20 @@
   <!-- Native lightbox -->
   <div id="lb" class="lb">
     <div class="lb-bg" id="lb-bg"></div>
+    <div class="lb-bloom" id="lb-bloom"></div>
     <div class="lb-content" id="lb-content"></div>
+
     <button class="lb-close" id="lb-close">✕</button>
     <button class="lb-nav lb-prev" id="lb-prev">&#8249;</button>
     <button class="lb-nav lb-next" id="lb-next">&#8250;</button>
     <div class="lb-info" id="lb-info"></div>
+  </div>
+
+  <div id="cp-overlay" class="cp-overlay" onclick="closeCP()">
+    <div class="cp-box" onclick="event.stopPropagation()">
+      <input type="text" id="cp-input" class="cp-input" placeholder="Jump to channel, category, or setting..." autocomplete="off">
+      <div id="cp-results" class="cp-results"></div>
+    </div>
   </div>
 
   <div id="true-preview" class="true-preview"></div>
