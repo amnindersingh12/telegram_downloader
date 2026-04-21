@@ -11,3 +11,6 @@ venv/
 .venv/
 .env
 *.db*
+*.log
+logs/
+scratch/
