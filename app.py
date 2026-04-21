@@ -375,7 +375,7 @@ async def get_preview(channel_id: int, msg_id: int, request: Request):
 
         # 3. Fetch from TG
         c = await _client()
-        entity = await c.get_entity(channel_id)
+        entity = await _get_entity_robust(c, channel_id)
         msg = await c.get_messages(entity, ids=msg_id)
         mt = _media_type(msg)
         
@@ -418,7 +418,7 @@ async def get_file(channel_id: int, msg_id: int, request: Request):
     """Stream a file from Telegram directly to the user's browser for local save."""
     try:
         c = await _client()
-        entity = await c.get_entity(channel_id)
+        entity = await _get_entity_robust(c, channel_id)
         msg = await c.get_messages(entity, ids=msg_id)
         if not msg or not msg.media:
             raise HTTPException(404, "Media not found")

@@ -78,17 +78,19 @@ def _db_init() -> None:
         
         # Migration: Ensure channel IDs are marked (negative) as per Telethon standard.
         # This fixes issues with private channels where positive IDs are ambiguous.
-        rows = c.execute("SELECT id, type FROM channels WHERE id > 0").fetchall()
-        for r in rows:
-            old_id = r["id"]
-            if r["type"] == "channel":
-                new_id = int("-100" + str(old_id))
-            else: # group
-                new_id = -old_id
-            
-            c.execute("UPDATE channels SET id=? WHERE id=?", (new_id, old_id))
-            c.execute("UPDATE media SET channel_id=? WHERE channel_id=?", (new_id, old_id))
-            c.execute("UPDATE downloads SET channel_id=? WHERE channel_id=?", (new_id, old_id))
+        # Fixed: Only run once by checking for id > 0
+        to_migrate = c.execute("SELECT id, type FROM entities WHERE id > 0").fetchall()
+        if to_migrate:
+            for r in to_migrate:
+                old_id = r["id"]
+                if r["type"] == "channel":
+                    new_id = int("-100" + str(old_id))
+                else: # group
+                    new_id = -old_id
+                
+                c.execute("UPDATE entities SET id=? WHERE id=?", (new_id, old_id))
+                c.execute("UPDATE media SET channel_id=? WHERE channel_id=?", (new_id, old_id))
+                c.execute("UPDATE downloads SET channel_id=? WHERE channel_id=?", (new_id, old_id))
 
 
 async def _db_run(fn: Callable) -> Any:

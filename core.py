@@ -159,8 +159,14 @@ async def _client() -> TelegramClient:
 
 async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
     """Try to get entity. If ID-based lookups fail, sweep dialogs to find and cache it."""
+    # 1. Memory Cache
+    if isinstance(peer, (int, float)) and int(peer) in st.entity_cache:
+        return st.entity_cache[int(peer)]
+    
     try:
-        return await client.get_entity(peer)
+        ent = await client.get_entity(peer)
+        if hasattr(ent, "id"): st.entity_cache[ent.id] = ent
+        return ent
     except Exception:
         # Only sweep if peer looks like an ID
         is_id = False
@@ -174,6 +180,7 @@ async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
         if is_id:
             logger.info(f"Entity {pid} not in cache — sweeping dialogs...")
             async for d in client.iter_dialogs(limit=None):
+                st.entity_cache[d.id] = d.entity
                 if d.id == pid:
                     return d.entity
         raise
@@ -327,12 +334,7 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
     # 3. Telegram — try stripped thumb first (no download, instant)
     try:
         c = await _client()
-        # Use entity cache to avoid repeated get_entity calls
-        if channel_id in st.entity_cache:
-            entity = st.entity_cache[channel_id]
-        else:
-            entity = await c.get_entity(channel_id)
-            st.entity_cache[channel_id] = entity
+        entity = await _get_entity_robust(c, channel_id)
         msg = await c.get_messages(entity, ids=msg_id)
 
         thumb_bytes = None
@@ -453,6 +455,7 @@ async def _media_sse(
         min_id = last_cached
 
         buf = []
+        new_batch = []
         async for msg in _iter_with_retry(c, entity, filter=tf, limit=None,
                                           min_id=min_id):
             if await request.is_disconnected():
@@ -462,13 +465,27 @@ async def _media_sse(
                 continue
             
             buf.append(item)
-            yield f"data: {json.dumps(item)}\n\n"
+            new_batch.append(item)
             
-            if len(buf) >= 50:
+            # Yield new items in batches of 50 for smoother UI
+            if len(new_batch) >= 50:
+                yield f"data: {json.dumps({'batch': new_batch})}\n\n"
+                new_batch = []
+
+            if len(buf) >= 100:
                 await _db_run(lambda b=list(buf): _db_cache_media_batch(b))
+                # Trigger thumb pre-fetch for the batch
+                for i in buf:
+                    if i.get("has_media"):
+                        t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.jpg"
+                        if not t_path.exists():
+                            st.thumb_queue.put_nowait((cid, i["msg_id"]))
                 buf.clear()
                 await asyncio.sleep(0)
         
+        if new_batch:
+            yield f"data: {json.dumps({'batch': new_batch})}\n\n"
+
         if buf:
             await _db_run(lambda b=list(buf): _db_cache_media_batch(b))
             for i in buf:

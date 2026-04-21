@@ -27,7 +27,7 @@ if (document.body.classList.contains('idx-page')) {
           thumbObs.unobserve(e.target);
         }
       });
-    }, { rootMargin: '2500px' });
+    }, { rootMargin: '800px' });
 
     // ── View switcher ───────────────────────────────────────────────────────
     window.sv = v => {
@@ -227,7 +227,7 @@ if (document.body.classList.contains('idx-page')) {
         if (!item) return;
 
         // Ensure visible
-        const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+        const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
         const row = Math.floor(peekIdx / columns);
         const targetTop = row * rowH;
         
@@ -523,7 +523,7 @@ if (document.body.classList.contains('idx-page')) {
       const grid = document.getElementById('mgrid');
       if (!grid) return;
       viewportHeight = grid.clientHeight;
-      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
       columns = Math.floor((grid.clientWidth - 24) / rowH) || 1;
       renderVirtual();
     }
@@ -537,7 +537,7 @@ if (document.body.classList.contains('idx-page')) {
         return;
       }
 
-      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+      const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
       columns = Math.floor((grid.clientWidth - 24) / rowH) || 1;
       const totalRows = Math.ceil(filteredKeys.length / columns);
       const totalH = totalRows * rowH;
@@ -644,7 +644,7 @@ if (document.body.classList.contains('idx-page')) {
           lasso.style.height = height + 'px';
           
           const lassoBounds = { left, top, right: left + width, bottom: top + height };
-          const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+          const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
           const totalGapWidth = (columns - 1) * gap;
           const itemWidth = (mgrid.clientWidth - 24 - totalGapWidth) / columns;
           const colW = itemWidth + gap;
@@ -714,8 +714,12 @@ if (document.body.classList.contains('idx-page')) {
         for (const k of keys) {
           const it = items.get(k);
           if (!it) continue;
-          const hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
-          if (!words.every(w => hay.includes(w))) continue;
+          
+          if (!it.hay) {
+            it.hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
+          }
+
+          if (!words.every(w => it.hay.includes(w))) continue;
           let score = 0;
           const fn = (it.filename || '').toLowerCase();
           const cap = (it.caption || '').toLowerCase();
@@ -776,13 +780,15 @@ if (document.body.classList.contains('idx-page')) {
         if (d.batch) {
           d.batch.forEach(item => {
             const key = `${item.channel_id}_${item.msg_id}`;
+            item.hay = `${item.filename || ''} ${item.caption || ''} ${item.date || ''} ${item.type || ''}`.toLowerCase();
             items.set(key, item);
             allMediaKeys.push(key);
             cnt++;
           });
-          document.getElementById('sbar-txt').textContent = `${cnt} from cache`;
+          document.getElementById('sbar-txt').textContent = `${cnt} items loaded`;
           updPillCounts();
-          applyFilters();
+          if (vsRAF) cancelAnimationFrame(vsRAF);
+          vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
           return;
         }
         if (d.done) {
@@ -797,10 +803,13 @@ if (document.body.classList.contains('idx-page')) {
         items.set(key, d);
         allMediaKeys.push(key);
         cnt++;
-        if (cnt % 50 === 0) {
+        if (cnt % 100 === 0) {
           document.getElementById('sbar-txt').textContent = `Loading… ${cnt}`;
           updPillCounts();
-          if (!paused) applyFilters();
+          if (!paused) {
+            if (vsRAF) cancelAnimationFrame(vsRAF);
+            vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
+          }
         }
       };
       stream.onerror = () => { if (stream) { stream.close(); stream = null; } document.getElementById('sbar-txt').textContent = `${cnt} items`; };
