@@ -59,7 +59,7 @@ from telethon.tl.types import (
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
-from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
+from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule, _db_get_media_bulk
 from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, _run_mirror, \
     _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust, _restore_jobs, \
     _fetch_thumb, _thumb_worker
@@ -104,8 +104,7 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     
     await _restore_jobs()
     # Parallel thumbnail workers for high-speed pre-fetching
-    for _ in range(4):
-        asyncio.create_task(_thumb_worker())
+    asyncio.create_task(_thumb_worker())
     asyncio.create_task(_cleanup_previews_worker())
     yield
     # Graceful shutdown: cancel all active downloads
@@ -128,8 +127,8 @@ async def _cleanup_previews_worker():
             from config import PREVIEWS
             if not PREVIEWS.exists(): continue
             
-            # Max 10GB of previews
-            MAX_SIZE = 10 * 1024 * 1024 * 1024
+            # Max 60GB of previews (leveraging spare 100GB storage)
+            MAX_SIZE = 60 * 1024 * 1024 * 1024
             files = []
             total_size = 0
             for f in PREVIEWS.glob("*"):
@@ -363,9 +362,9 @@ async def get_media(
 async def get_thumb(channel_id: int, msg_id: int):
     # Priority: return instantly if on disk
     key = f"{channel_id}_{msg_id}"
-    t_path = THUMBS_DIR / f"{key}.jpg"
+    t_path = THUMBS_DIR / f"{key}.webp"
     if t_path.exists():
-        return FileResponse(t_path, media_type="image/jpeg", 
+        return FileResponse(t_path, media_type="image/webp", 
                            headers={"Cache-Control": "public, max-age=31536000, immutable"})
     
     # Otherwise fetch (high priority)
@@ -731,38 +730,35 @@ async def stream_updates(request: Request):
 # ── Gallery data API ─────────────────────────────────────────────────────────
 @app.get("/api/gallery-data")
 async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-    """Return cached media items for the gallery, with pagination."""
+    """Return cached media items with high-performance bulk SQL fetching."""
     if channels:
         ids = [int(x) for x in channels.split(",") if x.strip()]
     else:
         chs = await _db_read(_db_get_channels)
         ids = [ch["id"] for ch in chs]
 
+    if not ids: return []
+
+    # Optimized bulk query instead of per-channel loop
+    rows = await _db_read(lambda: _db_get_media_bulk(ids, limit=limit, offset=offset))
     result = []
-    # For simplicity when multiple channels are selected, we fetch from all
-    # In a perfect world, we'd have a single SQL query for all IDs
-    for cid in ids:
-        # Note: This is still a bit heavy for 42 channels if we don't limit per channel
-        # or use a global join. For now, let's limit the total result.
-        if len(result) >= limit: break
-        rows = await _db_read(lambda c=cid: _db_get_media(c, "all", limit=limit, offset=offset))
-        for row in rows:
-            t = row["type"]
-            result.append({
-                "type":       t if t in ("photo", "video") else "document",
-                "thumb":      f"/api/thumb/{cid}/{row['msg_id']}",
-                "preview":    f"/api/preview/{cid}/{row['msg_id']}",
-                "title":      row["filename"],
-                "sub":        row.get("date", "") or "",
-                "caption":    row.get("caption", "") or "",
-                "channel_id": cid,
-                "msg_id":     row["msg_id"],
-                "size":       row.get("size", 0),
-            })
-            # Trigger background prefetch for missing thumbs only
-            t_path = THUMBS_DIR / f"{cid}_{row['msg_id']}.jpg"
-            if not t_path.exists():
-                st.thumb_queue.put_nowait((cid, row["msg_id"]))
+    for row in rows:
+        cid = row["channel_id"]
+        mid = row["msg_id"]
+        t = row["type"]
+        result.append({
+            "type":       t if t in ("photo", "video") else "document",
+            "thumb":      f"/api/thumb/{cid}/{mid}",
+            "preview":    f"/api/preview/{cid}/{mid}",
+            "title":      row["filename"],
+            "sub":        row.get("date", "") or "",
+            "caption":    row.get("caption", "") or "",
+            "channel_id": cid,
+            "msg_id":     mid,
+            "size":       row.get("size", 0),
+            "date_ts":    row.get("date_ts", 0),
+            "st_b64":     row.get("st_b64"),
+        })
     return result
 
 

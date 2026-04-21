@@ -167,12 +167,20 @@ async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
             if clean.isdigit(): is_id = True; pid = int(peer)
         
         if is_id:
+            # Prevent repetitive sweeps for known missing IDs
+            now = datetime.now().timestamp()
+            last_sweep = getattr(st, "_last_sweep", 0)
+            if now - last_sweep < 60: # Max one sweep per minute
+                logger.warning(f"Entity {pid} not found; skipping sweep (too soon)")
+                raise errors.PeerIdInvalidError(None)
+
+            st._last_sweep = now
             logger.info(f"Entity {pid} not in cache — sweeping dialogs...")
             async for d in client.iter_dialogs(limit=None):
                 st.entity_cache[d.id] = d.entity
                 if d.id == pid:
                     return d.entity
-        raise
+        raise errors.PeerIdInvalidError(None)
 
 
 async def _iter_with_retry(client, entity, max_retries=3, **kwargs):
@@ -252,6 +260,29 @@ def _hr_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _get_stripped_thumb(msg: Any) -> Optional[str]:
+    """Extract and convert Telegram's PhotoStrippedSize to a usable base64 JPG."""
+    from telethon.utils import stripped_to_jpg
+    media = getattr(msg, "media", None)
+    if not media: return None
+    
+    photo = getattr(msg, "photo", None)
+    doc = getattr(msg, "document", None)
+    
+    sizes = []
+    if photo: sizes = getattr(photo, "sizes", [])
+    elif doc: sizes = getattr(doc, "thumbs", [])
+    
+    for s in sizes:
+        if isinstance(s, types.PhotoStrippedSize):
+            try:
+                import base64
+                return base64.b64encode(stripped_to_jpg(s.bytes)).decode()
+            except:
+                pass
+    return None
+
+
 def _fname(msg: Any) -> str:
     doc = getattr(msg, "document", None)
     if doc:
@@ -293,12 +324,16 @@ def _msg_to_item(msg: Any, channel_id: int) -> Optional[dict]:
         "size": _size(msg),
         "size_readable": _hr_size(_size(msg)),
         "date": msg.date.isoformat() if msg.date else None,
+        "date_ts": int(msg.date.timestamp()) if msg.date else 0,
         "caption": (msg.message or "").strip(),
+        "st_b64": _get_stripped_thumb(msg),
         "w": w,
         "h": h,
         "has_media": bool(getattr(msg, 'media', None))
     }
 
+
+_thumb_sem = asyncio.Semaphore(3)
 
 async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
     """
@@ -306,7 +341,7 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
     If missing, fetches from Telegram (stripped then full download).
     """
     key = f"{channel_id}_{msg_id}"
-    t_path = THUMBS_DIR / f"{key}.jpg"
+    t_path = THUMBS_DIR / f"{key}.webp"
     
     # 1. RAM (O(1))
     data = st.thumbs.get(key)
@@ -321,60 +356,78 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
         except Exception: pass
         
     # 3. Telegram — try stripped thumb first (no download, instant)
-    try:
-        c = await _client()
-        entity = await _get_entity_robust(c, channel_id)
-        msg = await c.get_messages(entity, ids=msg_id)
+    async with _thumb_sem:
+        try:
+            c = await _client()
+            entity = await _get_entity_robust(c, channel_id)
+            msg = await c.get_messages(entity, ids=msg_id)
 
-        thumb_bytes = None
-        media = msg.media if msg else None
-        if media:
-            photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
-            if photo:
-                for sz in getattr(photo, 'thumbs', []) or []:
-                    if hasattr(sz, 'bytes') and sz.bytes:
-                        # PhotoStrippedSize — reconstruct JPEG
-                        raw = sz.bytes
-                        if len(raw) > 0 and raw[0] == 1:
-                            # Stripped format: needs JPEG header/footer
-                            header = bytes([
-                                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
-                                0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-                                0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-                                0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
-                                0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
-                                0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
-                                0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
-                                0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
-                                0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
-                                0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
-                                0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
-                                0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
-                                0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
-                                0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                            ])
-                            footer = bytes([0xFF, 0xD9])
-                            thumb_bytes = header + raw[3:] + footer
-                        else:
-                            thumb_bytes = raw
-                        break
+            thumb_bytes = None
+            media = msg.media if msg else None
+            if media:
+                photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
+                if photo:
+                    for sz in getattr(photo, 'thumbs', []) or []:
+                        if hasattr(sz, 'bytes') and sz.bytes:
+                            # PhotoStrippedSize — reconstruct JPEG
+                            raw = sz.bytes
+                            if len(raw) > 0 and raw[0] == 1:
+                                # Stripped format: needs JPEG header/footer
+                                header = bytes([
+                                    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+                                    0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+                                    0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+                                    0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
+                                    0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
+                                    0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
+                                    0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
+                                    0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
+                                    0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
+                                    0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
+                                    0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
+                                    0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
+                                    0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
+                                    0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                ])
+                                footer = bytes([0xFF, 0xD9])
+                                thumb_bytes = header + raw[3:] + footer
+                            else:
+                                thumb_bytes = raw
+                            break
 
-        if not thumb_bytes:
-            # Fallback: download smallest thumb
-            thumb_bytes = await c.download_media(msg, bytes, thumb=-1)
+            if not thumb_bytes:
+                # Fallback: download smallest thumb
+                thumb_bytes = await c.download_media(msg, bytes, thumb=-1)
 
-        if thumb_bytes:
-            st.thumbs.set(key, thumb_bytes)
-            t_path.write_bytes(thumb_bytes)
-            return thumb_bytes
-    except Exception as e:
-        logger.error(f"Failed to fetch thumbnail for {channel_id}_{msg_id}: {e}")
+            if thumb_bytes:
+                # Optimize to WebP
+                from PIL import Image
+                import io
+                try:
+                    with Image.open(io.BytesIO(thumb_bytes)) as img:
+                        img.thumbnail((320, 320)) # Ensure standard size
+                        out = io.BytesIO()
+                        img.save(out, format="WEBP", quality=80)
+                        thumb_webp = out.getvalue()
+                        st.thumbs.set(key, thumb_webp)
+                        t_path.write_bytes(thumb_webp)
+                        return thumb_webp
+                except Exception as e:
+                    logger.warning(f"WebP conversion failed, saving raw: {e}")
+                    st.thumbs.set(key, thumb_bytes)
+                    # Save as webp anyway to keep extension consistent, or just fallback
+                    t_path.write_bytes(thumb_bytes)
+                    return thumb_bytes
+        except Exception as e:
+            logger.error(f"Failed to fetch thumbnail for {channel_id}_{msg_id}: {e}")
+    
+    return None
     
     return None
 
@@ -388,7 +441,7 @@ async def _thumb_worker():
             cid, mid = await st.thumb_queue.get()
             try:
                 # Direct check first before calling expensive _fetch_thumb
-                t_path = THUMBS_DIR / f"{cid}_{mid}.jpg"
+                t_path = THUMBS_DIR / f"{cid}_{mid}.webp"
                 if not t_path.exists():
                     await _fetch_thumb(cid, mid)
             except errors.FloodWaitError as e:
@@ -436,7 +489,7 @@ async def _media_sse(
             
             # Pre-fetch only missing thumbnails for cached items
             for r in cached:
-                t_path = THUMBS_DIR / f"{cid}_{r['msg_id']}.jpg"
+                t_path = THUMBS_DIR / f"{cid}_{r['msg_id']}.webp"
                 if not t_path.exists():
                     st.thumb_queue.put_nowait((cid, r["msg_id"]))
         
@@ -466,20 +519,16 @@ async def _media_sse(
                 # Trigger thumb pre-fetch for the batch
                 for i in buf:
                     if i.get("has_media"):
-                        t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.jpg"
+                        t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.webp"
                         if not t_path.exists():
-                            st.thumb_queue.put_nowait((cid, i["msg_id"]))
+                            st.thumb_queue.put_nowait((cid, i['msg_id']))
                 buf.clear()
-                await asyncio.sleep(0)
-        
-        if new_batch:
-            yield f"data: {json.dumps({'batch': new_batch})}\n\n"
 
         if buf:
             await _db_run(lambda b=list(buf): _db_cache_media_batch(b))
             for i in buf:
                 if i.get("has_media"):
-                    t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.jpg"
+                    t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.webp"
                     if not t_path.exists():
                         st.thumb_queue.put_nowait((cid, i["msg_id"]))
             buf.clear()

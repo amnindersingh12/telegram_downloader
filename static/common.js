@@ -9,10 +9,17 @@ function hrSize(n) {
   return s.toFixed(1) + ' TB';
 }
 async function api(url, opts = {}) {
-  const r = await fetch(url, opts);
-  const d = await r.json();
-  if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
-  return d;
+  const { timeout = 15000, ...fetchOpts } = opts;
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), timeout);
+  try {
+    const r = await fetch(url, { ...fetchOpts, signal: controller.signal });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+    return d;
+  } finally {
+    clearTimeout(tid);
+  }
 }
 function chk() {
   return '<svg style="width:100%;height:100%" viewBox="0 0 10 10" fill="none"><polyline points="1,5 4,8 9,2" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';

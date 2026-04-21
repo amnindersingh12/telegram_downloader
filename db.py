@@ -23,9 +23,9 @@ def _db_init() -> None:
     with _db_connect() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
-        c.execute("PRAGMA cache_size=-128000")       # 128MB in-memory cache
+        c.execute("PRAGMA cache_size=-512000")       # 512MB in-memory cache
         c.execute("PRAGMA temp_store=MEMORY")
-        c.execute("PRAGMA mmap_size=67108864")      # 64MB memory-mapped I/O
+        c.execute("PRAGMA mmap_size=2147483648")    # 2GB memory-mapped I/O
         c.executescript("""
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY, type TEXT, title TEXT,
@@ -34,9 +34,9 @@ def _db_init() -> None:
         );
         CREATE TABLE IF NOT EXISTS media (
             channel_id INTEGER, msg_id INTEGER, type TEXT,
-            filename TEXT, size INTEGER, date TEXT, caption TEXT DEFAULT '',
-            w INTEGER DEFAULT 0, h INTEGER DEFAULT 0, tags TEXT DEFAULT '',
-            PRIMARY KEY (channel_id, msg_id)
+            filename TEXT, size INTEGER, date TEXT, date_ts INTEGER DEFAULT 0,
+            caption TEXT DEFAULT '', w INTEGER DEFAULT 0, h INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '', PRIMARY KEY (channel_id, msg_id)
         );
         CREATE TABLE IF NOT EXISTS downloads (
             channel_id INTEGER, msg_id INTEGER, filepath TEXT,
@@ -71,6 +71,10 @@ def _db_init() -> None:
             c.execute("ALTER TABLE media ADD COLUMN w INTEGER DEFAULT 0")
         if "h" not in cols:
             c.execute("ALTER TABLE media ADD COLUMN h INTEGER DEFAULT 0")
+        if "st_b64" not in cols:
+            c.execute("ALTER TABLE media ADD COLUMN st_b64 TEXT")
+        if "date_ts" not in cols:
+            c.execute("ALTER TABLE media ADD COLUMN date_ts INTEGER DEFAULT 0")
         
         m_cols = [r["name"] for r in c.execute("PRAGMA table_info(mirrors)").fetchall()]
         if "logs" not in m_cols:
@@ -130,10 +134,10 @@ def _db_cache_media_batch(items: list[dict]) -> None:
         return
     with _db_connect() as c:
         c.executemany(
-            "INSERT OR IGNORE INTO media (channel_id, msg_id, type, filename, size, date, caption, w, h) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO media (channel_id, msg_id, type, filename, size, date, date_ts, caption, w, h, st_b64) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             [(i["channel_id"], i["msg_id"], i["type"],
-              i["filename"], i["size"], i.get("date"), i.get("caption", ""),
-              i.get("w", 0), i.get("h", 0))
+              i["filename"], i["size"], i.get("date"), i.get("date_ts", 0), i.get("caption", ""),
+              i.get("w", 0), i.get("h", 0), i.get("st_b64"))
              for i in items],
         )
 
@@ -150,6 +154,17 @@ def _db_get_media(channel_id: int, mtype: str = "all", limit: int = 5000, offset
                 f"SELECT * FROM media WHERE channel_id=? AND type=? ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
                 (channel_id, mtype)
             ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _db_get_media_bulk(channel_ids: list[int], limit: int = 5000, offset: int = 0) -> list[dict]:
+    with _db_connect() as c:
+        if not channel_ids: return []
+        placeholders = ",".join(["?"] * len(channel_ids))
+        rows = c.execute(
+            f"SELECT * FROM media WHERE channel_id IN ({placeholders}) ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
+            channel_ids
+        ).fetchall()
         return [dict(r) for r in rows]
 
 

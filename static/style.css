@@ -29,8 +29,8 @@
   --video: #bf5af2;
   --doc:   #ff9f0a;
 
-  /* Modern Font Stack */
-  --font: "Inter", "Roboto", -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+  /* Modern System-First Font Stack (Eliminates blocking web-font loads) */
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
 
   /* Radii & Sizes (Softer 8px UI) */
   --r:  8px;
@@ -726,6 +726,21 @@ input:focus {
   box-shadow: 0 0 10px var(--adim);
 }
 
+.mc {
+  background: var(--surface);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  border: 1px solid var(--border);
+  height: var(--row-h);
+  cursor: pointer;
+  content-visibility: auto; /* Off-screen rendering optimization */
+  contain-intrinsic-size: 1 / 1; /* Match aspect ratio for stable layout */
+}
+
 .ch {
   display: flex;
   align-items: center;
@@ -1257,6 +1272,7 @@ select.sort {
   padding: 0;
   -webkit-overflow-scrolling: touch;
   will-change: scroll-position;
+  overscroll-behavior-y: contain;
   background: var(--bg);
 }
 
@@ -1310,13 +1326,15 @@ select.sort {
   cursor: pointer;
   background: var(--panel);
   border: 1px solid var(--border);
-  padding: 0; /* No padding for full visual */
+  padding: 0;
   display: flex !important;
   flex-direction: column;
   box-sizing: border-box;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   animation: fadeUp 0.4s ease-out;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  content-visibility: auto; /* Off-screen rendering optimization */
+  contain-intrinsic-size: auto 300px; /* Estimates height for stable scrollbar */
 }
 
 .mc:hover {
@@ -1345,17 +1363,25 @@ select.sort {
 
 
 /* Thumbnail / Media Area */
-.m-thumb-area {
+.mc .m-thumb-area {
   position: relative;
   width: 100%;
-  aspect-ratio: 16 / 9; /* Consistent cinematic aspect ratio */
-  background: var(--bg);
+  aspect-ratio: 1 / 1; /* Hard-coded ratio prevents layout shift during lazy load */
+  background: var(--adim);
   overflow: hidden;
-  flex-shrink: 0;
+  border-radius: calc(var(--r) - 2px);
+  z-index: 1;
+}
+.gallery-mode .mc .m-thumb-area {
+  aspect-ratio: 16 / 9;
+}
+.mc .nth {
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1;
+  background: radial-gradient(circle at center, var(--adim) 0%, transparent 70%);
 }
 
 /* Subtle bottom-to-top dark gradient for text legibility */
@@ -2313,8 +2339,8 @@ header {
    ANIMATIONS
    ============================================================ */
 @keyframes fadeUp {
-  0% { opacity: 0; transform: translateY(16px) scale(.98); }
-  100% { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .m-logs {

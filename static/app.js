@@ -17,6 +17,15 @@ if (document.body.classList.contains('idx-page')) {
     let renderBuf = [];
     let cardIdx = 0;
     let viewMode = 'gallery';
+    let loadNonce = 0;
+    let currentSearch = '';
+    let currentSort = '';
+    let allMediaKeys = [];
+    let filteredKeys = [];
+    let viewportHeight = 0;
+    let columns = 1;
+    let vsRAF = null;
+    let peekIdx = -1;
     const gap = 24;
 
     // ── IndexedDB Caching ────────────────────────────────────────────────
@@ -119,22 +128,10 @@ if (document.body.classList.contains('idx-page')) {
       });
     }
 
-    async function hydrateRAM() {
-      if (!idb) return;
-      const tx = idb.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.getAll();
-      req.onsuccess = () => {
-        req.result.forEach(it => {
-          it.hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
-          mediaRegistry.set(it.key, it);
-        });
-        console.log(`RAM Hydrated: ${mediaRegistry.size} items`);
-      };
-    }
 
     const COLORS = ['#4f8eff', '#ff6b8a', '#35d47b', '#ffb84f', '#a78bff', '#ff9b3d', '#0ecfcf'];
 
+    // ── High-Performance Observers ──────────────────────────────────────────
     const thumbObs = new IntersectionObserver(entries => {
       entries.forEach(e => {
         if (e.isIntersecting) {
@@ -142,7 +139,15 @@ if (document.body.classList.contains('idx-page')) {
           thumbObs.unobserve(e.target);
         }
       });
-    }, { rootMargin: '800px' });
+    }, { rootMargin: '100px' }); // Targeted pre-fetch to reduce concurrent I/O
+
+    const prefetchPreview = (key) => {
+      const item = items.get(key);
+      if (!item || item._prefetched) return;
+      const img = new Image();
+      img.src = `/api/preview/${item.channel_id}/${item.msg_id}`;
+      item._prefetched = true;
+    };
 
     // ── View switcher ───────────────────────────────────────────────────────
     window.sv = v => {
@@ -217,8 +222,6 @@ if (document.body.classList.contains('idx-page')) {
         renderFolderTabs();
       }
 
-      // Background RAM hydration
-      hydrateRAM();
       
       // Add sync activity card - if it doesn't exist, it will be prepended (top)
       if (!document.getElementById('job-sync_activity')) {
@@ -261,232 +264,440 @@ if (document.body.classList.contains('idx-page')) {
       es.onerror = () => es.close();
       updViewport();
       startLiveUpdates();
-      initHoverPreview();
     }
 
-    function initHoverPreview() {
-      const tp = document.getElementById('true-preview');
-      let peekT;
+    // ── Previews & Hover Interactions ───────────────────────────────────
+    if (!document.getElementById('true-preview')) {
+        const tp = document.createElement('div');
+        tp.id = 'true-preview';
+        tp.className = 'true-preview-box';
+        document.body.appendChild(tp);
+    }
+    const tp = document.getElementById('true-preview');
+    let peekT;
+    let previewAbort = null;
 
-      window.showTruePreview = (key, e) => {
-        clearTimeout(peekT);
-        // Small 30ms debounce to skip items the user is just passing over
-        peekT = setTimeout(async () => {
-          const it = items.get(key) || mediaRegistry.get(key);
-          if (!it) return;
-          
-          tp.innerHTML = '';
-          // Show thumb as placeholder while full preview loads
-          const thumbBlob = await getThumb(key);
-          const thumbUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : null;
+    window.showTruePreview = (key, e) => {
+      clearTimeout(peekT);
+      if (previewAbort) previewAbort.abort();
+      previewAbort = new AbortController();
+      const signal = previewAbort.signal;
 
-          if (it.type === 'video') {
-            const v = document.createElement('video');
-            if (thumbUrl) v.poster = thumbUrl;
-            v.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
-            v.autoplay = true; v.muted = true; v.loop = true;
-            tp.appendChild(v);
-          } else if (it.type === 'photo') {
-            const img = new Image();
-            if (thumbUrl) img.style.backgroundImage = `url(${thumbUrl})`;
-            img.style.backgroundSize = 'cover';
-            img.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
-            tp.appendChild(img);
-          } else {
-            return;
-          }
-          
-          tp.style.display = 'block';
-          moveTruePreview(e);
-        }, 30);
-      };
-
-      window.hideTruePreview = () => {
-        clearTimeout(peekT);
-        tp.style.display = 'none';
+      peekT = setTimeout(async () => {
+        if (signal.aborted) return;
+        const it = items.get(key) || mediaRegistry.get(key);
+        if (!it) return;
+        
         tp.innerHTML = '';
-      };
-
-      window.moveTruePreview = (e) => {
-        if (tp.style.display !== 'block') return;
-        let x = e.clientX + 20;
-        let y = (e.type === 'keydown' ? e.clientY + 50 : e.clientY + 20);
+        const thumbBlob = await getThumb(key, signal);
+        if (signal.aborted) return;
+        const thumbUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : null;
         
-        const pad = 15;
-        if (x + 450 > window.innerWidth) x = e.clientX - 470;
-        if (x < pad) x = pad;
-        if (y + tp.offsetHeight > window.innerHeight) y = window.innerHeight - tp.offsetHeight - pad;
-        if (y < pad) y = pad;
-        
-        tp.style.left = x + 'px'; tp.style.top = y + 'px';
-      };
-
-      window.updGridSize = (val) => {
-        document.documentElement.style.setProperty('--row-h', val + 'px');
-        renderVirtual();
-      };
-
-      window.peekByKeys = (dir, e) => {
-        if (!filteredKeys.length) return;
-        
-        // Remove old focus
-        document.querySelectorAll('.mc.kb-focus').forEach(el => el.classList.remove('kb-focus'));
-
-        const mgrid = document.getElementById('mgrid');
-        let columns = Math.floor(mgrid.clientWidth / (parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220));
-        if (columns < 1) columns = 1;
-
-        if (dir === 'left') peekIdx--;
-        else if (dir === 'right') peekIdx++;
-        else if (dir === 'up') peekIdx -= columns;
-        else if (dir === 'down') peekIdx += columns;
-
-        if (peekIdx < 0) peekIdx = 0;
-        if (peekIdx >= filteredKeys.length) peekIdx = filteredKeys.length - 1;
-
-        const key = filteredKeys[peekIdx];
-        const item = items.get(key);
-        if (!item) return;
-
-        // Ensure visible
-        const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
-        const row = Math.floor(peekIdx / columns);
-        const targetTop = row * rowH;
-        
-        if (targetTop < mgrid.scrollTop) mgrid.scrollTop = targetTop;
-        else if (targetTop + rowH > mgrid.scrollTop + mgrid.clientHeight) mgrid.scrollTop = targetTop + rowH - mgrid.clientHeight;
-
-        // Show preview
-        const cards = document.querySelectorAll('.mc');
-        let cardEl = null;
-        for (const c of cards) { if (c.dataset.key === key) { cardEl = c; break; } }
-        
-        let rect = { left: 100, top: 100 };
-        if (cardEl) {
-          cardEl.classList.add('kb-focus');
-          rect = cardEl.getBoundingClientRect();
-        }
-
-        // Trigger preview
-        clearTimeout(peekT);
-        tp.innerHTML = '';
-        if (item.type === 'video') {
+        if (it.type === 'video') {
           const v = document.createElement('video');
-          v.src = `/api/preview/${item.channel_id}/${item.msg_id}`;
+          if (thumbUrl) v.poster = thumbUrl;
+          v.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
           v.autoplay = true; v.muted = true; v.loop = true;
           tp.appendChild(v);
-        } else if (item.type === 'photo') {
-          const img = document.createElement('img');
-          img.src = `/api/preview/${item.channel_id}/${item.msg_id}`;
-          tp.appendChild(img);
-        }
-        tp.style.display = 'block';
-        tp.style.left = (rect.left + 50) + 'px';
-        tp.style.top = (rect.top + 50) + 'px';
-      };
+        } else if (it.type === 'photo') {
+          const img = new Image();
+          if (thumbUrl) img.style.backgroundImage = `url(${thumbUrl})`;
+          img.style.backgroundSize = 'cover';
+          img.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
+          img.decode().then(() => {
+            if (signal.aborted) return;
+            tp.appendChild(img);
+            tp.style.display = 'block';
+            moveTruePreview(e);
+          }).catch(() => {
+            // Fallback for browsers without decode or error cases
+            if (signal.aborted) return;
+            tp.appendChild(img);
+            tp.style.display = 'block';
+            moveTruePreview(e);
+          });
+          return; // Handled by decode promise
+        } else return;
+      }, 50); // Snappy but debounced
+    };
 
-      // Command Palette Logic
-      let cpIdx = -1;
-      let cpFiltered = [];
+    window.hideTruePreview = () => { clearTimeout(peekT); tp.style.display = 'none'; tp.innerHTML = ''; };
 
-      window.toggleCP = (e) => {
-        if (e) e.preventDefault();
-        const overlay = document.getElementById('cp-overlay');
-        const input = document.getElementById('cp-input');
-        overlay.classList.add('active');
-        input.value = '';
-        input.focus();
-        searchCP('');
-      };
+    window.moveTruePreview = (e) => {
+      if (tp.style.display !== 'block') return;
+      let x = e.clientX + 20;
+      let y = (e.type === 'keydown' ? e.clientY + 50 : e.clientY + 20);
+      const pad = 15;
+      if (x + 450 > window.innerWidth) x = e.clientX - 470;
+      if (x < pad) x = pad;
+      if (y + tp.offsetHeight > window.innerHeight) y = window.innerHeight - tp.offsetHeight - pad;
+      if (y < pad) y = pad;
+      tp.style.left = x + 'px'; tp.style.top = y + 'px';
+    };
 
-      window.closeCP = () => {
-        document.getElementById('cp-overlay').classList.remove('active');
-      };
+    window.updGridSize = (val) => {
+      document.documentElement.style.setProperty('--row-h', val + 'px');
+      renderVirtual();
+    };
 
-      window.searchCP = (q) => {
-        const results = document.getElementById('cp-results');
-        q = q.toLowerCase();
+    window.peekByKeys = (dir, e) => {
+      if (!filteredKeys.length) return;
+      
+      const mgrid = document.getElementById('mgrid');
+      let cols = Math.floor(mgrid.clientWidth / (parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220));
+      if (cols < 1) cols = 1;
+
+      if (dir === 'left') peekIdx--;
+      else if (dir === 'right') peekIdx++;
+      else if (dir === 'up') peekIdx -= cols;
+      else if (dir === 'down') peekIdx += cols;
+
+      if (peekIdx < 0) peekIdx = 0;
+      if (peekIdx >= filteredKeys.length) peekIdx = filteredKeys.length - 1;
+
+      const key = filteredKeys[peekIdx];
+      const item = items.get(key);
+      if (!item) return;
+
+      // Update UI focus immediately for responsiveness
+      document.querySelectorAll('.mc.kb-focus').forEach(el => el.classList.remove('kb-focus'));
+      const cardEl = document.querySelector(`.mc[data-key="${key}"]`);
+      if (cardEl) {
+        cardEl.classList.add('kb-focus');
+        const rect = cardEl.getBoundingClientRect();
         
-        const commands = [
-          { text: 'View Photos', icon: '📷', type: 'Category', action: () => setFilter('photo') },
-          { text: 'View Videos', icon: '🎬', type: 'Category', action: () => setFilter('video') },
-          { text: 'View Documents', icon: '📄', type: 'Category', action: () => setFilter('document') },
-          { text: 'View All Media', icon: '🖼️', type: 'Category', action: () => setFilter('all') },
-          { text: 'Wipe Cache', icon: '🧹', type: 'System', action: () => { if(confirm('Wipe cache?')) wipeCache(); } }
-        ];
+        // Clear preview if navigating by keys
+        clearTimeout(peekT);
+        hideTruePreview();
 
-        const chs = allChs.map(c => ({ text: c.title, icon: '📡', type: 'Channel', action: () => { switchSTab('channels'); selectChannel(c.id); } }));
-        
-        cpFiltered = [...commands, ...chs].filter(item => 
-          item.text.toLowerCase().includes(q) || item.type.toLowerCase().includes(q)
-        ).slice(0, 15);
-
-        cpIdx = 0;
-        renderCP();
-      };
-
-      function renderCP() {
-        const box = document.getElementById('cp-results');
-        box.innerHTML = cpFiltered.map((it, i) => `
-          <div class="cp-item ${i === cpIdx ? 'active' : ''}" onclick="execCP(${i})">
-            <span class="cp-item-icon">${it.icon}</span>
-            <span class="cp-item-text">${esc(it.text)}</span>
-            <span class="cp-item-type">${it.type}</span>
-          </div>
-        `).join('');
-        const active = box.querySelector('.cp-item.active');
-        if (active) active.scrollIntoView({ block: 'nearest' });
+        // Auto-scroll logic
+        const rowH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 150;
+        const row = Math.floor(peekIdx / cols);
+        const targetTop = row * rowH;
+        if (targetTop < mgrid.scrollTop) mgrid.scrollTop = targetTop;
+        else if (targetTop + rowH > mgrid.scrollTop + mgrid.clientHeight) mgrid.scrollTop = targetTop + rowH - mgrid.clientHeight;
       }
+    };
 
-      window.execCP = (i) => {
-        const it = cpFiltered[i];
-        if (it) {
-          it.action();
-          closeCP();
-        }
-      };
+    // Command Palette Logic
+    let cpIdx = -1;
+    let cpFiltered = [];
 
-      document.addEventListener('keydown', e => {
-        if (document.getElementById('cp-overlay').classList.contains('active')) {
-          if (e.key === 'ArrowDown') { e.preventDefault(); cpIdx = (cpIdx + 1) % cpFiltered.length; renderCP(); }
-          else if (e.key === 'ArrowUp') { e.preventDefault(); cpIdx = (cpIdx - 1 + cpFiltered.length) % cpFiltered.length; renderCP(); }
-          else if (e.key === 'Enter') { e.preventDefault(); execCP(cpIdx); }
-          else if (e.key === 'Escape') { e.preventDefault(); closeCP(); }
-          return;
-        }
+    window.toggleCP = (e) => {
+      if (e) e.preventDefault();
+      const overlay = document.getElementById('cp-overlay');
+      const input = document.getElementById('cp-input');
+      overlay.classList.add('active'); input.value = ''; input.focus();
+      searchCP('');
+    };
 
-        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-          toggleCP(e);
-        }
-      });
+    window.closeCP = () => document.getElementById('cp-overlay').classList.remove('active');
 
-      document.getElementById('cp-input')?.addEventListener('input', (e) => searchCP(e.target.value));
+    window.searchCP = (q) => {
+      q = q.toLowerCase();
+      const commands = [
+        { text: 'View Photos', icon: '📷', type: 'Category', action: () => setFilter('photo') },
+        { text: 'View Videos', icon: '🎬', type: 'Category', action: () => setFilter('video') },
+        { text: 'View Documents', icon: '📄', type: 'Category', action: () => setFilter('document') },
+        { text: 'View All Media', icon: '🖼️', type: 'Category', action: () => setFilter('all') },
+        { text: 'Wipe Cache', icon: '🧹', type: 'System', action: () => { if(confirm('Wipe cache?')) wipeCache(); } }
+      ];
+      const chs = allChs.map(c => ({ text: c.title, icon: '📡', type: 'Channel', action: () => { selectChannel(c.id); } }));
+      cpFiltered = [...commands, ...chs].filter(it => it.text.toLowerCase().includes(q) || it.type.toLowerCase().includes(q)).slice(0, 15);
+      cpIdx = cpFiltered.length > 0 ? 0 : -1;
+      renderCP();
+    };
+
+    function renderCP() {
+      const box = document.getElementById('cp-results');
+      if (!box) return;
+      box.innerHTML = cpFiltered.map((it, i) => `
+        <div class="cp-item ${i === cpIdx ? 'active' : ''}" onclick="execCP(${i})">
+          <span class="cp-item-icon">${it.icon}</span>
+          <span class="cp-item-text">${esc(it.text)}</span>
+          <span class="cp-item-type">${it.type}</span>
+        </div>`).join('');
+      const active = box.querySelector('.cp-item.active');
+      if (active) active.scrollIntoView({ block: 'nearest' });
     }
 
+    window.execCP = (i) => { 
+      const it = cpFiltered[i]; 
+      if (it) { 
+        console.log('Executing CP Action:', it.text);
+        it.action(); 
+        closeCP(); 
+      } 
+    };
+
+    const cpInput = document.getElementById('cp-input');
+    if (cpInput) {
+        cpInput.addEventListener('keydown', e => {
+            if (!cpFiltered.length) return;
+            if (e.key === 'ArrowDown') { e.preventDefault(); cpIdx = (cpIdx + 1) % cpFiltered.length; renderCP(); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); cpIdx = (cpIdx - 1 + cpFiltered.length) % cpFiltered.length; renderCP(); }
+            else if (e.key === 'Enter') { e.preventDefault(); execCP(cpIdx); }
+            else if (e.key === 'Escape') { e.preventDefault(); closeCP(); }
+        });
+        cpInput.addEventListener('input', e => searchCP(e.target.value));
+    }
+
+    async function loadMedia(chs = null) {
+      if (!chs) chs = Array.from(selChs);
+      if (chs.length === 0) return;
+      if (stream) { stream.close(); stream = null; }
+      
+      const nonce = ++loadNonce;
+      items.clear(); allMediaKeys = []; filteredKeys = [];
+      const grid = document.getElementById('mgrid');
+      if (grid) grid.style.display = 'block';
+      document.getElementById('empty').style.display = 'none';
+      document.getElementById('sbar').classList.add('active');
+      document.getElementById('pause-btn').style.display = 'block';
+      const sbarTxt = document.getElementById('sbar-txt');
+      const chIds = [...selChs];
+      const ids = chIds.join(',');
+
+      // 1. Try local cache (RAM + IndexedDB) first for instant results
+      const localItems = await getCachedItems(chIds);
+      if (localItems.length > 0) {
+        localItems.forEach(it => {
+          if (!it.hay) it.hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
+          if (!mediaRegistry.has(it.key)) mediaRegistry.set(it.key, it);
+          if (!items.has(it.key)) {
+            items.set(it.key, it);
+            allMediaKeys.push(it.key);
+          }
+        });
+      }
+      
+      // 2. Hydrate from server if local cache is sparse
+      if (items.size < 100) {
+          sbarTxt.textContent = 'Hydrating library...';
+          try {
+              // Fetch a reasonable chunk for initial view
+              const cacheData = await api(`/api/gallery-data?channels=${ids}&limit=2000`, { timeout: 10000 });
+              if (nonce !== loadNonce) return;
+              cacheData.forEach(it => {
+                  const key = `${it.channel_id}_${it.msg_id}`;
+                  it.key = key;
+                  it.hay = `${it.filename || ''} ${it.caption || ''} ${it.date || ''} ${it.type || ''}`.toLowerCase();
+                  if (!mediaRegistry.has(key)) mediaRegistry.set(key, it);
+                  if (!items.has(key)) { items.set(key, it); allMediaKeys.push(key); }
+              });
+              // Persist to IDB in background
+              cacheBatch(cacheData);
+          } catch(e) { 
+              console.warn('Cache hydration failed or timed out', e);
+              if (nonce !== loadNonce) return;
+              sbarTxt.textContent = 'Hydration deferred, scanning...';
+          }
+      }
+
+      if (allMediaKeys.length > 0) {
+        // Only sort if array is not too massive to avoid UI freeze
+        if (allMediaKeys.length < 20000) {
+            allMediaKeys.sort((a, b) => items.get(b).msg_id - items.get(a).msg_id);
+        }
+        sbarTxt.textContent = `${items.size} items (ready)`;
+        updPillCounts(); applyFilters();
+      } else sbarTxt.textContent = 'Scanning channel...';
+      
+      // 3. Revalidation Stream (only fetches what's missing)
+      stream = new EventSource(`/api/media?channels=${ids}&type=all`);
+
+      stream.onmessage = e => {
+        if (nonce !== loadNonce) { stream.close(); return; }
+        const d = JSON.parse(e.data);
+        if (d.batch) {
+          const fresh = [];
+          d.batch.forEach(item => {
+            const key = `${item.channel_id}_${item.msg_id}`;
+            item.key = key;
+            item.hay = `${item.filename || ''} ${item.caption || ''} ${item.date || ''} ${item.type || ''}`.toLowerCase();
+            if (!mediaRegistry.has(key)) { mediaRegistry.set(key, item); items.set(key, item); allMediaKeys.push(key); fresh.push(item); }
+          });
+            if (fresh.length > 0) {
+              cacheBatch(fresh);
+              if (allMediaKeys.length < 30000) {
+                allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
+              }
+              sbarTxt.textContent = `${items.size} items live`;
+              updPillCounts(); 
+              // Throttle UI updates
+              if (!vsRAF) vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
+            }
+          return;
+        }
+        if (d.done) {
+          stream.close(); stream = null; sbarTxt.textContent = `${items.size} items`;
+          document.getElementById('pause-btn').style.display = 'none'; document.getElementById('stop-btn').style.display = 'none';
+          updPillCounts(); applyFilters(); return;
+        }
+        const key = `${d.channel_id}_${d.msg_id}`;
+        if (!mediaRegistry.has(key)) {
+          d.key = key; 
+          mediaRegistry.set(key, d); 
+          items.set(key, d); 
+          allMediaKeys.push(key); 
+          cacheBatch([d]);
+          if (allMediaKeys.length % 100 === 0) { 
+             if (allMediaKeys.length < 30000) allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
+             if (!vsRAF) vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
+          }
+        }
+      };
+    }
+    
+    window.togglePause = () => { paused = !paused; document.getElementById('pause-btn').textContent = paused ? '▶ Resume' : '⏸ Pause'; if (!paused) renderVirtual(); };
+    window.stopStream = () => { if (stream) { stream.close(); stream = null; document.getElementById('sbar-txt').textContent = 'Stopped'; document.getElementById('pause-btn').style.display = 'none'; document.getElementById('stop-btn').style.display = 'none'; toast('Media loading stopped', ''); } };
+
+    async function loadThumb(cardEl, item) {
+      if (!item || item.type === 'document') return;
+      const key = `${item.channel_id}_${item.msg_id}`;
+      const cachedBlob = await getThumb(key);
+      if (cachedBlob) { _applyThumb(cardEl, item, URL.createObjectURL(cachedBlob), false); return; }
+
+      const url = `/api/thumb/${item.channel_id}/${item.msg_id}`;
+      fetch(url, { priority: 'high' }).then(r => r.blob()).then(blob => {
+        if (blob.size < 100) throw new Error('Short blob');
+        storeThumb(key, blob);
+        _applyThumb(cardEl, item, URL.createObjectURL(blob), true);
+      }).catch(() => {
+        const area = cardEl.querySelector('.m-thumb-area');
+        if (area) area.style.filter = 'none';
+      });
+    }
+
+    function makeCard(key, item) {
+      const sel = selItems.has(key);
+      const isDoc = item.type === 'document';
+      const el = document.createElement('div');
+      el.className = 'mc' + (sel ? ' sel' : '') + (isDoc ? ' mc-doc' : '');
+      el.dataset.key = key;
+      el.onclick = (e) => {
+        if (e.target.closest('.mchk')) { e.stopPropagation(); toggleSel(key, el, e); }
+        else if (e.target.closest('.mpreview')) { e.stopPropagation(); openPreview(key); }
+        else {
+          if (e.ctrlKey || e.metaKey || selItems.size > 0 || window.innerWidth <= 768) toggleSel(key, el, e);
+          else openPreview(key);
+        }
+      };
+      
+      let hoverPrefT;
+      el.onmouseenter = (e) => { 
+        showTruePreview(key, e); 
+        hoverPrefT = setTimeout(() => prefetchPreview(key), 80); 
+      };
+      el.onmouseleave = () => { hideTruePreview(); clearTimeout(hoverPrefT); };
+      el.onmousemove = (e) => moveTruePreview(e);
+      el.ondblclick = ev => { ev.stopPropagation(); openPreview(key); };
+
+      const iconHtml = ICONS[item.type] || '❓';
+      const cap = item.caption || '';
+      
+      // Only apply LQIP blur to photos; show videos and docs clearly from the start
+      const lqip = item.st_b64 ? `url(data:image/jpeg;base64,${item.st_b64})` : 'none';
+      const blur = (item.type === 'photo' && item.st_b64) ? 'blur(12px)' : 'none';
+
+      el.innerHTML = `
+        <div class="m-thumb-area" style="background-image: ${lqip}; background-size: cover; filter: ${blur}; transition: filter 0.6s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s ease;">
+          <div class="nth"><div class="ti">${iconHtml}</div></div>
+          <div class="mchk">${chk()}</div>
+          <div class="tbadge ${item.type.charAt(0)}">${item.type.toUpperCase()}</div>
+          <div class="mpreview">${ICONS.search}</div>
+          ${cap ? `<div class="mcap" title="${esc(cap)}">${esc(cap.slice(0, 200))}</div>` : ''}
+        </div>
+        <div class="m-details">
+          <div class="mfn" title="${esc(item.filename)}">${esc(item.filename)}</div>
+          <div class="msz">${item.size_readable || hrSize(item.size)}</div>
+        </div>`;
+      el.style.position = 'absolute';
+      return el;
+    }
+
+    // Observers moved to global scope
+
+    function _applyThumb(cardEl, item, url, isNew) {
+      const area = cardEl.querySelector('.m-thumb-area');
+      if (area) {
+        // High-res swap
+        const temp = new Image();
+        temp.onload = () => {
+          area.style.backgroundImage = `url(${url})`;
+          area.style.filter = 'none'; // Smoothly reveal
+        };
+        temp.src = url;
+      }
+      const nth = cardEl.querySelector('.nth');
+      if (item.type === 'video') {
+        const vid = document.createElement('video');
+        vid.poster = url; vid.muted = true; vid.loop = true; vid.setAttribute('playsinline', ''); vid.className = 'card-vid';
+        if (nth) nth.replaceWith(vid);
+        cardEl.style.setProperty('--bg-img', `url(${url})`);
+        if (area) area.style.filter = 'none'; // Ensure video cards are un-blurred immediately
+        cardEl.onmouseenter = (e) => {
+          showTruePreview(item.key, e);
+          if (!vid.src) { vid.src = `/api/preview/${item.channel_id}/${item.msg_id}`; vid.load(); }
+          vid.play().catch(() => {});
+        };
+        cardEl.onmouseleave = () => { hideTruePreview(); vid.pause(); };
+      } else {
+        const img = new Image();
+        img.src = url;
+        img.decode().then(() => {
+          cardEl.style.setProperty('--bg-img', `url(${url})`); 
+          if (nth) nth.replaceWith(img); 
+          if (area) area.style.filter = 'none'; // Ensure un-blur
+        }).catch(() => {
+          // Fallback if decode fails or unsupported
+          cardEl.style.setProperty('--bg-img', `url(${url})`); 
+          if (nth) nth.replaceWith(img); 
+          if (area) area.style.filter = 'none'; 
+        });
+      }
+    }
+
+    function toggleSel(key, el, e) {
+      if (e && e.shiftKey && lastSelKey && filteredKeys.includes(lastSelKey)) {
+        const idxA = filteredKeys.indexOf(lastSelKey), idxB = filteredKeys.indexOf(key);
+        const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+        for (let i = start; i <= end; i++) selItems.add(filteredKeys[i]);
+      } else {
+        if (selItems.has(key)) { selItems.delete(key); lastSelKey = null; }
+        else { selItems.add(key); lastSelKey = key; }
+      }
+      renderVirtual(); updSelCount();
+    }
+
+    window.selAll = () => {
+      const allKeys = [...items.keys()];
+      const allSel = allKeys.every(k => selItems.has(k));
+      if (allSel) allKeys.forEach(k => selItems.delete(k));
+      else allKeys.forEach(k => selItems.add(k));
+      renderVirtual(); updSelCount();
+    };
+
+    function updSelCount() {
+      const n = selItems.size; const el = document.getElementById('selc'); if (el) el.textContent = n;
+      const bb = document.querySelector('.bb'); if (bb) { if (n > 0) bb.classList.add('active'); else bb.classList.remove('active'); }
+      let totalSize = 0; selItems.forEach(k => { const it = items.get(k); if (it) totalSize += it.size || 0; });
+      const bbc = document.querySelector('.bbc'); if (bbc) bbc.innerHTML = `<b>${n}</b> item${n !== 1 ? 's' : ''} · ${hrSize(totalSize)} selected`;
+    }
 
     function startLiveUpdates() {
       if (window.updateES) window.updateES.close();
-      const es = new EventSource('/api/updates');
-      window.updateES = es;
+      const es = new EventSource('/api/updates'); window.updateES = es;
       es.onmessage = e => {
         const ev = JSON.parse(e.data);
         if (ev.type === 'new_message') {
           const ch = allChs.find(c => c.id === ev.channel_id);
-          if (ch) {
-            ch.unread = (ch.unread || 0) + 1;
-            ch.pulsing = true;
-            renderChannelList();
-            setTimeout(() => { ch.pulsing = false; renderChannelList(); }, 600);
-          }
-          // Live Gallery Update
+          if (ch) { ch.unread = (ch.unread || 0) + 1; renderChannelList(); }
           if (ev.item && selChs.has(ev.channel_id)) {
             const key = `${ev.item.channel_id}_${ev.item.msg_id}`;
             if (!mediaRegistry.has(key)) {
-              ev.item.key = key;
-              ev.item.hay = `${ev.item.filename || ''} ${ev.item.caption || ''} ${ev.item.date || ''} ${ev.item.type || ''}`.toLowerCase();
-              mediaRegistry.set(key, ev.item);
-              items.set(key, ev.item);
-              allMediaKeys.push(key);
+              ev.item.key = key; ev.item.hay = (ev.item.filename + ' ' + ev.item.caption).toLowerCase();
+              mediaRegistry.set(key, ev.item); items.set(key, ev.item); allMediaKeys.push(key);
               allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
               requestAnimationFrame(() => applyFilters());
             }
@@ -496,59 +707,23 @@ if (document.body.classList.contains('idx-page')) {
       es.onerror = () => { es.close(); setTimeout(startLiveUpdates, 5000); };
     }
 
-    function renderFolderTabs() {
-      let el = document.getElementById('folder-tabs');
-      if (!el) {
-        const parent = document.getElementById('sp-channels');
-        const ss = parent.querySelector('.ss');
-        el = document.createElement('div');
-        el.id = 'folder-tabs';
-        el.className = 'ftabs';
-        el.style.alignItems = 'center'; // Align with dropdown
-        parent.insertBefore(el, ss);
-      }
-      
-      const hasUnreadTab = folders.some(f => f.name.toLowerCase() === 'unread');
-      const tabs = [{name: '', emoji: '🏠', label: 'All'}];
-      
-      if (!hasUnreadTab) {
-        tabs.push({name: 'unread_virtual', emoji: '🔔', label: 'Unread'});
-      } else {
-        // Move unread to front if it's in folders
-        const idx = folders.findIndex(f => f.name.toLowerCase() === 'unread');
-        if (idx > -1) {
-          const f = folders.splice(idx, 1)[0];
-          tabs.push({...f, label: (f.emoji ? f.emoji + ' ' : '') + f.name});
-        }
-      }
+    // ── Global Initializer ──────────────────────────────────────────
+    (async () => {
+      try {
+        const r = await api('/api/auth/status');
+        if (r.authenticated) { sv('vapp'); initApp(); startLiveUpdates(); }
+        else sv('va');
+        if (window.lucide) lucide.createIcons();
+      } catch { sv('va'); }
+    })();
 
-      // Primary view
-      let html = tabs.map(t =>
-        `<button class="ftab${t.name === activeFolder ? ' active' : ''}" onclick="setFolder('${esc(t.name)}')">${esc(t.label)}</button>`
-      ).join('');
-
-      // Dropdown for the rest
-      if (folders.length > 0) {
-        const isSecondarySelected = folders.some(f => f.name === activeFolder);
-        html += `
-          <div class="folder-dropdown">
-            <select class="ftab ${isSecondarySelected ? 'active' : ''}" 
-                    style="appearance:none; border:none; padding-right:24px; position:relative"
-                    onchange="setFolder(this.value)">
-              <option value="" disabled ${!isSecondarySelected ? 'selected' : ''}>📁 Categories...</option>
-              ${folders.map(f => `
-                <option value="${esc(f.name)}" ${f.name === activeFolder ? 'selected' : ''}>
-                  ${f.emoji ? f.emoji + ' ' : ''}${esc(f.name)}
-                </option>
-              `).join('')}
-            </select>
-            <div style="position:absolute; right:10px; top:50%; transform:translateY(-50%); pointer-events:none; font-size:8px; opacity:0.5">▼</div>
-          </div>
-        `;
-      }
-      
-      el.innerHTML = html;
-    }
+    document.addEventListener('keydown', e => {
+      const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+      if (isInput) return;
+      if (e.key === 'Escape') { lbClose(); hideTruePreview(); closeCP(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); toggleCP(); }
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); peekByKeys(e.key.replace('Arrow', '').toLowerCase(), e); }
+    });
 
     window.setFolder = name => {
       activeFolder = name;
@@ -557,6 +732,20 @@ if (document.body.classList.contains('idx-page')) {
     };
 
     // ── Channel list ────────────────────────────────────────────────────────
+    const ICONS = {
+      photo: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
+      video: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`,
+      document: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`,
+      search: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`
+    };
+
+    function hrSize(b) {
+      if (b === 0) return '0 B';
+      const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(b) / Math.log(k));
+      return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
     function chColor(t) {
       return COLORS[Math.abs([...t].reduce((a, c) => a + c.charCodeAt(0), 0)) % COLORS.length];
     }
@@ -657,33 +846,35 @@ if (document.body.classList.contains('idx-page')) {
         const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
         for (let i = start; i <= end; i++) selChs.add(currentVisibleChs[i]);
       } else {
-        if (selChs.has(id)) {
-          selChs.delete(id);
-          lastSelChId = null;
-        } else {
-          selChs.add(id);
-          lastSelChId = id;
-        }
+        if (selChs.has(id)) { selChs.delete(id); lastSelChId = null; }
+        else { selChs.add(id); lastSelChId = id; }
       }
-      
       const btn = document.getElementById('vmbtn');
       if (btn) btn.textContent = `${selChs.size} selected`;
       updSelAllBtn();
       renderChannelList();
-
-      // Auto-load immediately on selection change
       if (selChs.size > 0) loadMedia();
       else {
-        // Clear grid when nothing selected
         items.clear(); selItems.clear(); allMediaKeys = [];
         const grid = document.getElementById('mgrid');
-        if (grid) {
-          grid.innerHTML = ''; grid.style.display = 'none';
-        }
+        if (grid) { grid.innerHTML = ''; grid.style.display = 'none'; }
         document.getElementById('empty').style.display = 'flex';
         updPillCounts();
       }
     }
+
+    window.selectChannel = (id) => {
+      const numId = typeof id === 'string' ? parseInt(id) : id;
+      selChs.clear();
+      selChs.add(id); // Use original for Set
+      if (!isNaN(numId)) selChs.add(numId); // Dual-support for ID types
+
+      lastSelChId = id;
+      switchSTab('channels');
+      updSelAllBtn();
+      renderChannelList();
+      loadMedia();
+    };
 
     window.selAllChs = () => {
       let visible = allChs;
@@ -766,14 +957,6 @@ if (document.body.classList.contains('idx-page')) {
       document.querySelector('.sidebar')?.classList.remove('m-active');
     };
 
-    // ── Virtual Scroller State ──────────────────────────────────────────────
-    let allMediaKeys = [];
-    let filteredKeys = [];
-    let currentSearch = '';
-    let currentSort = '';
-    let viewportHeight = 0;
-    let columns = 1;
-    let vsRAF = null;
 
     function updViewport() {
       const grid = document.getElementById('mgrid');
@@ -784,7 +967,7 @@ if (document.body.classList.contains('idx-page')) {
       renderVirtual();
     }
 
-    function renderVirtual() {
+    function renderVirtual(dir = 'down') {
       const grid = document.getElementById('mgrid');
       if (!grid) return;
 
@@ -793,31 +976,44 @@ if (document.body.classList.contains('idx-page')) {
         return;
       }
 
-      const desiredWidth = 320;
-      columns = Math.floor((grid.clientWidth - 24) / desiredWidth) || 1;
+      const zoomVal = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 220;
+      const desiredWidth = zoomVal;
+      const gap = 24;           // Matches --gap in CSS
+      columns = Math.max(1, Math.floor((grid.clientWidth - 24) / (desiredWidth + gap)));
       const totalGapWidth = (columns - 1) * gap;
       const itemWidth = (grid.clientWidth - 24 - totalGapWidth) / columns;
-      const rowH = (itemWidth * 9 / 16) + gap; 
+      
+      // Detect aspect ratio based on mode
+      const isGallery = grid.classList.contains('gallery-mode');
+      const rowH = isGallery ? (itemWidth * 9 / 16) + gap : itemWidth + gap;
 
       const totalRows = Math.ceil(filteredKeys.length / columns);
-      const totalH = totalRows * rowH;
+      const totalH = totalRows * rowH + 60;
 
       let spacer = grid.querySelector('.vs-spacer');
       if (!spacer) {
         spacer = document.createElement('div');
         spacer.className = 'vs-spacer';
+        spacer.style.height = '1px';
         spacer.style.width = '1px';
         spacer.style.position = 'absolute';
         grid.prepend(spacer);
       }
-      spacer.style.height = totalH + 'px';
+      spacer.style.top = totalH + 'px'; // Push footer
       grid.style.position = 'relative';
 
       const st = grid.scrollTop;
       const vh = grid.clientHeight || 800;
-      const buffer = 4;
-      const startRow = Math.max(0, Math.floor(st / rowH) - buffer);
-      const endRow = Math.min(totalRows, Math.ceil((st + vh) / rowH) + buffer);
+      
+      // ── Extreme Windowing ──
+      const baseBuffer = 1; // Minimal buffer for memory efficiency
+      const predBuffer = 3; 
+      
+      let startRow = Math.max(0, Math.floor(st / rowH) - baseBuffer);
+      let endRow = Math.min(totalRows, Math.ceil((st + vh) / rowH) + baseBuffer);
+      
+      if (dir === 'down') endRow = Math.min(totalRows, endRow + predBuffer);
+      else if (dir === 'up') startRow = Math.max(0, startRow - predBuffer);
 
       const startIdx = startRow * columns;
       const endIdx = Math.min(endRow * columns, filteredKeys.length);
@@ -834,38 +1030,55 @@ if (document.body.classList.contains('idx-page')) {
 
       // Track existing
       const existing = new Map();
-      for (const c of grid.children) existing.set(c.dataset.key, c);
+      for (const c of grid.children) if (c.dataset.key) existing.set(c.dataset.key, c);
 
-      // Add/position visible cards
+      // Positioning visible cards using GPU-accelerated Transforms
+      const fragment = document.createDocumentFragment();
+      let added = 0;
+
       visibleKeys.forEach((key, i) => {
         const item = items.get(key);
         if (!item) return;
 
         let el = existing.get(key);
-        if (!el) {
+        const isNew = !el;
+        if (isNew) {
           el = makeCard(key, item);
           thumbObs.observe(el);
-          el.dataset.obs = '1';
-          grid.appendChild(el);
+          fragment.appendChild(el);
+          added++;
         }
 
         const globalIdx = startIdx + i;
         const row = Math.floor(globalIdx / columns);
         const col = globalIdx % columns;
-        el.style.position = 'absolute';
         
         el.style.width = itemWidth + 'px';
         el.style.height = (rowH - gap) + 'px';
-        el.style.left = (12 + col * (itemWidth + gap)) + 'px';
-        el.style.top = (row * rowH + 12) + 'px';
+        
+        const x = 12 + col * (itemWidth + gap);
+        const y = 12 + row * rowH;
+        el.style.left = x + 'px';
+        el.style.top = y + 'px';
+        el.style.transform = ''; // Clear any animation remnants
       });
+
+      if (added > 0) grid.appendChild(fragment);
     }
 
     const mgrid = document.getElementById('mgrid');
+    let lastST = 0;
     if (mgrid) {
       mgrid.addEventListener('scroll', () => {
+        const st = mgrid.scrollTop;
+        const dir = st > lastST ? 'down' : 'up';
+        lastST = st;
+
         if (vsRAF) return;
-        vsRAF = requestAnimationFrame(() => { vsRAF = null; renderVirtual(); });
+        vsRAF = requestAnimationFrame(() => { 
+          vsRAF = null; 
+          renderVirtual(dir); 
+        });
       }, { passive: true });
 
       // ── Lasso Selection (Drag-to-select) ───────────────────────────────────
@@ -943,6 +1156,15 @@ if (document.body.classList.contains('idx-page')) {
       };
     }
 
+    // High-Precision Layout Watcher
+    if (mgrid) {
+      const ro = new ResizeObserver(() => {
+        if (vsRAF) return;
+        vsRAF = requestAnimationFrame(() => { vsRAF = null; renderVirtual(); });
+      });
+      ro.observe(mgrid);
+    }
+
     window.addEventListener('resize', updViewport);
 
     // ── Media loading ───────────────────────────────────────────────────────
@@ -999,10 +1221,11 @@ if (document.body.classList.contains('idx-page')) {
       if (currentSort) {
         keys.sort((a, b) => {
           const ia = items.get(a), ib = items.get(b);
-          if (currentSort === 'date-desc') return new Date(ib.date) - new Date(ia.date);
-          if (currentSort === 'date-asc') return new Date(ia.date) - new Date(ib.date);
-          if (currentSort === 'size-desc') return ib.size - ia.size;
-          if (currentSort === 'size-asc') return ia.size - ib.size;
+          if (!ia || !ib) return 0;
+          if (currentSort === 'date-desc') return (ib.date_ts || 0) - (ia.date_ts || 0);
+          if (currentSort === 'date-asc')  return (ia.date_ts || 0) - (ib.date_ts || 0);
+          if (currentSort === 'size-desc') return (ib.size || 0) - (ia.size || 0);
+          if (currentSort === 'size-asc')  return (ia.size || 0) - (ib.size || 0);
           return 0;
         });
       }
@@ -1011,322 +1234,45 @@ if (document.body.classList.contains('idx-page')) {
       renderVirtual();
     }
 
-    let loadNonce = 0;
-    window.loadMedia = async () => {
-      lbClose(); // Close lightbox if open
-      hideTruePreview(); // Close spacebar preview if open
-      const nonce = ++loadNonce;
-
-
-      if (!selChs.size) {
-        items.clear(); allMediaKeys = [];
-        document.getElementById('mgrid').innerHTML = '';
-        document.getElementById('empty').style.display = 'flex';
-        updPillCounts(); return;
-      }
-      
-      // Optimistic logic: don't clear everything if we are just adding a channel
-      // But for "truly fast" we just rebuild the keys in RAM.
-      allMediaKeys = []; 
-      items.clear(); 
-      applyFilters(); // Instant UI clear
-      
-      const grid = document.getElementById('mgrid');
-      if (grid) {
-        grid.style.display = 'block';
-      }
-      document.getElementById('empty').style.display = 'none';
-
-      document.getElementById('sbar').classList.add('active');
-      document.getElementById('pause-btn').style.display = 'block';
-      document.getElementById('stop-btn').style.display = 'block';
-      
-      const sbarTxt = document.getElementById('sbar-txt');
-      sbarTxt.textContent = 'Mapping memory...';
-
-      // ── Instant Load from RAM Registry ─────────────────────────────────
-      const chIds = [...selChs];
-      mediaRegistry.forEach(it => {
-        if (chIds.includes(it.channel_id)) {
-          items.set(it.key, it);
-          allMediaKeys.push(it.key);
-        }
-      });
-      
-      if (allMediaKeys.length > 0) {
-        allMediaKeys.sort((a, b) => {
-          const ia = items.get(a), ib = items.get(b);
-          return (ib.msg_id - ia.msg_id);
-        });
-        sbarTxt.textContent = `${items.size} items (instant)`;
-      } else {
-        sbarTxt.textContent = 'Waiting for stream...';
-      }
-      updPillCounts();
-      applyFilters();
-
-
-      if (stream) { stream.close(); stream = null; }
-      const ids = chIds.join(',');
-      let url = `/api/media?channels=${ids}&type=all`;
-      stream = new EventSource(url);
-
-      stream.onmessage = e => {
-        if (nonce !== loadNonce) { stream.close(); return; }
-        const d = JSON.parse(e.data);
-        if (d.batch) {
-          const fresh = [];
-          d.batch.forEach(item => {
-            const key = `${item.channel_id}_${item.msg_id}`;
-            item.key = key;
-            item.hay = `${item.filename || ''} ${item.caption || ''} ${item.date || ''} ${item.type || ''}`.toLowerCase();
-            if (!mediaRegistry.has(key)) {
-              mediaRegistry.set(key, item);
-              items.set(key, item);
-              allMediaKeys.push(key);
-              fresh.push(item);
-            }
-          });
-          if (fresh.length > 0) {
-            cacheBatch(fresh);
-            allMediaKeys.sort((a, b) => (items.get(b).msg_id - items.get(a).msg_id));
-            sbarTxt.textContent = `${items.size} items live`;
-            updPillCounts();
-            requestAnimationFrame(() => applyFilters());
-          }
-          return;
-        }
-        if (d.done) {
-          stream.close(); stream = null;
-          sbarTxt.textContent = `${items.size} items`;
-          document.getElementById('pause-btn').style.display = 'none';
-          document.getElementById('stop-btn').style.display = 'none';
-          updPillCounts(); applyFilters(); return;
-        }
-        const key = `${d.channel_id}_${d.msg_id}`;
-        if (!mediaRegistry.has(key)) {
-          d.key = key;
-          mediaRegistry.set(key, d);
-          items.set(key, d);
-          allMediaKeys.push(key);
-          cacheBatch([d]);
-          if (allMediaKeys.length % 50 === 0) {
-            allMediaKeys.sort((a, b) => (items.get(b).msg_id - items.get(a).msg_id));
-            applyFilters();
-          }
-        }
-      };
-    };
-
-    window.togglePause = () => {
-      paused = !paused;
-      document.getElementById('pause-btn').textContent = paused ? '▶ Resume' : '⏸ Pause';
-      if (!paused) renderVirtual();
-    };
-
-    window.stopStream = () => {
-      if (stream) {
-        stream.close(); stream = null;
-        document.getElementById('sbar-txt').textContent = 'Stopped';
-        document.getElementById('pause-btn').style.display = 'none';
-        document.getElementById('stop-btn').style.display = 'none';
-        toast('Media loading stopped', '');
-      }
-    };
-
-    function makeCard(key, item) {
-      const sel = selItems.has(key);
-      const isDoc = item.type === 'document';
-      const el = document.createElement('div');
-      el.className = 'mc' + (sel ? ' sel' : '') + (isDoc ? ' mc-doc' : '');
-      el.dataset.key = key;
-      el.onclick = (e) => {
-        if (e.target.closest('.mchk')) {
-          e.stopPropagation(); toggleSel(key, el, e);
-        } else if (e.target.closest('.mpreview')) {
-          e.stopPropagation(); openPreview(key);
-        } else {
-          if (e.ctrlKey || e.metaKey || selItems.size > 0 || window.innerWidth <= 768) toggleSel(key, el, e);
-          else openPreview(key);
-        }
-      };
-      el.onmouseenter = (e) => showTruePreview(key, e);
-      el.onmouseleave = () => hideTruePreview();
-      el.onmousemove = (e) => moveTruePreview(e);
-      el.ondblclick = ev => { ev.stopPropagation(); openPreview(key); };
-
-      const icon = { photo: '🖼️', video: '🎬', document: '📄' }[item.type] || '❓';
-      const cap = item.caption || '';
-      
-      el.innerHTML = `
-        <div class="m-thumb-area">
-          <div class="nth">
-            <div class="ti">${icon}</div>
-          </div>
-          <div class="mchk">${chk()}</div>
-          <div class="tbadge ${item.type.charAt(0)}">${item.type.toUpperCase()}</div>
-          <div class="mpreview">🔍</div>
-          ${cap ? `<div class="mcap" title="${esc(cap)}">${esc(cap.slice(0, 200))}</div>` : ''}
-        </div>
-        <div class="m-details">
-          <div class="mfn" title="${esc(item.filename)}">${esc(item.filename)}</div>
-          <div class="msz">${item.size_readable || hrSize(item.size)}</div>
-        </div>`;
-      return el;
-    }
-
-    const THUMB_CONCURRENCY = 16; // Increased concurrency
-    let thumbActive = 0;
-    const thumbQueue = [];
-
-    function drainThumbQueue() {
-      while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
-        const job = thumbQueue.shift();
-        thumbActive++;
-        job().finally(() => { thumbActive--; drainThumbQueue(); });
-      }
-    }
-
-    async function loadThumb(cardEl, item) {
-      if (!item || item.type === 'document') return;
-      const key = `${item.channel_id}_${item.msg_id}`;
-      
-      // ── Try Local Cache Header First ─────────────────────────────────────
-      const cachedBlob = await getThumb(key);
-      if (cachedBlob) {
-        const objectUrl = URL.createObjectURL(cachedBlob);
-        _applyThumb(cardEl, item, objectUrl, false); // false = don't re-cache
-        return;
-      }
-
-      // ── Network Fetch with High Priority ─────────────────────────────
-      const url = `/api/thumb/${item.channel_id}/${item.msg_id}`;
-      thumbQueue.push(() => new Promise(resolve => {
-        const nth = cardEl.querySelector('.nth');
-        if (!nth) { resolve(); return; }
-
-        fetch(url, { priority: 'high' }).then(r => r.blob()).then(blob => {
-          if (blob.size < 100) throw new Error('Empty thumb');
-          storeThumb(key, blob);
-          const objectUrl = URL.createObjectURL(blob);
-          _applyThumb(cardEl, item, objectUrl, true);
-          resolve();
-        }).catch(err => {
-          resolve();
-        });
-      }));
-      drainThumbQueue();
-    }
-
-    function _applyThumb(cardEl, item, url, isNew) {
-      const nth = cardEl.querySelector('.nth');
-      if (item.type === 'video') {
-        const vid = document.createElement('video');
-        vid.poster = url; vid.muted = true; vid.loop = true;
-        vid.setAttribute('playsinline', '');
-        vid.className = 'card-vid';
-        if (nth) nth.replaceWith(vid);
-        else {
-          const oldVid = cardEl.querySelector('.card-vid');
-          if (oldVid) oldVid.poster = url;
-        }
-        cardEl.style.setProperty('--bg-img', `url(${url})`);
-        
-        cardEl.onmouseenter = () => {
-          if (!vid.src) { 
-            vid.src = `/api/preview/${item.channel_id}/${item.msg_id}`; 
-            vid.load(); 
-          }
-          vid.play().catch(() => {});
-        };
-        cardEl.onmouseleave = () => { vid.pause(); };
-      } else {
-        const img = new Image();
-        img.onload = () => { 
-          cardEl.style.setProperty('--bg-img', `url(${url})`); 
-          if (nth) nth.replaceWith(img);
-          else {
-            const oldImg = cardEl.querySelector('img');
-            if (oldImg) oldImg.src = url;
-          }
-        };
-        img.src = url;
-      }
-    }
-
-    function toggleSel(key, el, e) {
-      if (e && e.shiftKey && lastSelKey && filteredKeys.includes(lastSelKey)) {
-        const idxA = filteredKeys.indexOf(lastSelKey);
-        const idxB = filteredKeys.indexOf(key);
-        const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
-        for (let i = start; i <= end; i++) selItems.add(filteredKeys[i]);
-      } else {
-        if (selItems.has(key)) { selItems.delete(key); lastSelKey = null; }
-        else { selItems.add(key); lastSelKey = key; }
-      }
-      renderVirtual(); updSelCount();
-    }
-
-    window.selAll = () => {
-      const allKeys = [...items.keys()];
-      const allSel = allKeys.every(k => selItems.has(k));
-      if (allSel) allKeys.forEach(k => selItems.delete(k));
-      else allKeys.forEach(k => selItems.add(k));
-      renderVirtual(); updSelCount();
-    };
-
-    function updSelCount() {
-      const n = selItems.size;
-      const el = document.getElementById('selc');
-      if (el) el.textContent = n;
-      const bb = document.querySelector('.bb');
-      const sf = document.querySelector('.floating-cta');
-      if (bb) {
-        if (n > 0) {
-          bb.classList.add('active');
-          if (sf && sf.classList.contains('active')) bb.classList.add('shifted');
-          else bb.classList.remove('shifted');
-        } else {
-          bb.classList.remove('active', 'shifted');
-        }
-      }
-      let totalSize = 0;
-      selItems.forEach(k => { const it = items.get(k); if (it) totalSize += it.size || 0; });
-      const sizeStr = n > 0 ? ` · ${hrSize(totalSize)}` : '';
-      const bbc = document.querySelector('.bbc');
-      if (bbc) bbc.innerHTML = `<b>${n}</b> item${n !== 1 ? 's' : ''}${sizeStr} selected`;
-      const btn = document.getElementById('dlbtn');
-      if (btn) btn.disabled = n === 0;
-      const sa = document.getElementById('selall-btn');
-      if (sa) {
-        const totalVisible = filteredKeys.length;
-        const allSel = totalVisible > 0 && n >= totalVisible;
-        sa.innerHTML = allSel ? '<span>✓</span> Deselect All' : '<span>✓</span> Select All';
-        sa.classList.toggle('all-selected', allSel);
-      }
-    }
-
-    window.searchMedia = q => { currentSearch = q.toLowerCase(); applyFilters(); };
-    window.sortMedia = by => { currentSort = by; applyFilters(); };
-    
+    const lb = document.getElementById('lb');
+    const lbCnt = document.getElementById('lb-content');
+    const lbInfo = document.getElementById('lb-info');
     let lbIdx = 0;
     let lbActiveMedia = null;
-    let lbNavigating = false;
-    const lb     = document.getElementById('lb');
-    const lbCnt  = document.getElementById('lb-content');
-    const lbInfo = document.getElementById('lb-info');
 
     function lbOpen(key) {
       lbIdx = filteredKeys.indexOf(key);
       if (lbIdx === -1) return;
       lb.classList.add('open');
       document.body.classList.add('lb-active');
-      lbLoad(lbIdx, 0);
+      lbLoad(lbIdx);
     }
 
-    function lbClose() { lb.classList.remove('open'); document.body.classList.remove('lb-active'); _lbCleanup(); }
+    function lbClose() {
+      lb.classList.remove('open');
+      document.body.classList.remove('lb-active');
+      if (lbActiveMedia) { lbActiveMedia.pause?.(); lbActiveMedia.src = ''; lbActiveMedia = null; }
+    }
 
-    function _lbCleanup() { if (lbActiveMedia) { lbActiveMedia.pause?.(); lbActiveMedia.src = ''; lbActiveMedia = null; } }
+    async function lbLoad(idx) {
+      const key = filteredKeys[idx];
+      const item = items.get(key);
+      if (!item) return;
+
+      lbCnt.innerHTML = '<div class="lb-loader"></div>';
+      const counter = `<span style="font-weight:700; color:var(--accent); margin-right:12px">${idx + 1} / ${filteredKeys.length}</span>`;
+      lbInfo.innerHTML = `${counter} ${esc(item.filename)} <span style="opacity:0.6; margin-left:12px">${hrSize(item.size)} · ${item.date}</span>`;
+
+      const media = await _buildMedia(item);
+      lbCnt.innerHTML = '';
+      lbCnt.appendChild(media);
+      lbActiveMedia = media;
+      
+      // Prefetch siblings
+      _preload(idx + 1);
+      _preload(idx - 1);
+    }
+
     async function _buildMedia(item) {
       const url = `/api/preview/${item.channel_id}/${item.msg_id}`;
       if (item.type === 'video') {
@@ -1336,62 +1282,42 @@ if (document.body.classList.contains('idx-page')) {
       }
       return new Promise((resolve) => {
         const img = new Image();
-        img.onload  = () => resolve(img);
-        img.onerror = () => { const d = document.createElement('div'); d.textContent = 'Preview not available'; d.style.cssText = 'color:rgba(255,255,255,.4);font-size:13px;padding:40px'; resolve(d); };
+        img.onload = () => resolve(img);
+        img.onerror = () => {
+          const d = document.createElement('div');
+          d.textContent = 'Preview not available';
+          d.style.cssText = 'color:rgba(255,255,255,.4);font-size:13px;padding:40px';
+          resolve(d);
+        };
         img.src = url;
       });
     }
-    async function lbLoad(idx, dir) {
-      if (lbNavigating) return;
-      lbNavigating = true;
-      const key  = filteredKeys[idx];
-      const item = items.get(key);
-      if (!item) { lbNavigating = false; return; }
-      lbInfo.textContent = `${item.filename}  ·  ${item.size_readable || hrSize(item.size)}  ·  ${idx + 1} / ${filteredKeys.length}`;
-      
-      const bloom = document.getElementById('lb-bloom');
-      if (bloom) bloom.innerHTML = '';
 
-      if (dir === 0 || !lbCnt.firstChild) {
-        lbCnt.innerHTML = '<div class="lb-spinner"></div>';
-        const el = await _buildMedia(item);
-        if (item.type === 'video') lbActiveMedia = el;
-        lbCnt.innerHTML = ''; lbCnt.appendChild(el);
-        
-        // Update Bloom
-        if (bloom) {
-          const bl = el.cloneNode();
-          if (item.type === 'video') { bl.muted = true; bl.autoplay = true; bl.loop = true; bl.controls = false; }
-          bloom.appendChild(bl);
-        }
+    function openPreview(key) { lbOpen(key); }
+    window.openPreview = openPreview;
 
-        el.style.animation = 'lb-fadein 0.3s ease both';
-        lbNavigating = false; _preload(idx+1); _preload(idx-1); return;
-      }
-      const outgoing = lbCnt.firstChild;
-      const SLIDE_DUR = 320;
-      outgoing.style.animation = `lb-slide-out-${dir > 0 ? 'left' : 'right'} ${SLIDE_DUR}ms cubic-bezier(0.4,0,0.2,1) both`;
-      const [el] = await Promise.all([_buildMedia(item), new Promise(r => setTimeout(r, SLIDE_DUR * 0.35))]);
-      _lbCleanup(); if (item.type === 'video') lbActiveMedia = el;
-      lbCnt.innerHTML = ''; lbCnt.appendChild(el);
-
-      // Update Bloom
-      if (bloom) {
-        const bl = el.cloneNode();
-        if (item.type === 'video') { bl.muted = true; bl.autoplay = true; bl.loop = true; bl.controls = false; }
-        bloom.appendChild(bl);
-      }
-
-      el.style.animation = `lb-slide-in-${dir > 0 ? 'right' : 'left'} ${SLIDE_DUR}ms cubic-bezier(0.4,0,0.2,1) both`;
-      lbNavigating = false; _preload(idx+1); _preload(idx-1);
-    }
+    window.searchMedia = q => { currentSearch = q.toLowerCase(); applyFilters(); };
+    window.sortMedia = by => { currentSort = by; applyFilters(); };
 
     function _preload(idx) {
+      if (idx < 0 || idx >= filteredKeys.length) return;
       const k = filteredKeys[idx]; if (!k) return;
       const it = items.get(k); if (!it || it.type === 'video') return;
-      const p = new Image(); p.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
+      if (it._lb_prefetched) return;
+      
+      const p = new Image(); 
+      p.src = `/api/preview/${it.channel_id}/${it.msg_id}`;
+      it._lb_prefetched = true;
     }
-    function lbNav(dir) { const next = lbIdx + dir; if (next < 0 || next >= filteredKeys.length) return; lbIdx = next; lbLoad(lbIdx, dir); }
+    function lbNav(dir) { 
+        const next = lbIdx + dir; 
+        if (next < 0 || next >= filteredKeys.length) return; 
+        lbIdx = next; 
+        lbLoad(lbIdx, dir); 
+        // Aggressive sequential prefetching (+2, -2)
+        _preload(lbIdx + 1); _preload(lbIdx + 2);
+        _preload(lbIdx - 1); _preload(lbIdx - 2);
+    }
 
     const lbCloseBtn = document.getElementById('lb-close');
     if (lbCloseBtn) lbCloseBtn.onclick = lbClose;
@@ -1456,23 +1382,7 @@ if (document.body.classList.contains('idx-page')) {
       document.getElementById('pdrawer').classList.add('open');
       const card = document.createElement('div');
       card.className = 'pitem'; card.id = `j-${job_id}`;
-      card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div><button class="vbtn" style="width:auto;padding:3px 8px;font-.status-pill.active { color: var(--ok); background: rgba(48, 209, 88, 0.1); border-color: rgba(48, 209, 88, 0.2); }
-
-.conn-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.2);
-  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-  flex-shrink: 0;
-  margin-left: 4px;
-}
-.conn-dot.active {
-  background: var(--ok);
-  box-shadow: 0 0 10px rgba(48, 209, 88, 0.4);
-}
-onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div><div class="pm"><span id="pc-${job_id}">Queued…</span><span id="pp-${job_id}">0%</span></div><div id="logs-${job_id}" class="m-logs" style="display:none"></div><div class="perr" id="pe-${job_id}" style="display:none"></div><button class="pcancel" onclick="cancelJob('${job_id}')">Cancel</button>`;
+      card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div class="pn">📦 ${count} file${count !== 1 ? 's' : ''}</div><button class="vbtn" style="width:auto;padding:3px 8px;font-size:10px" onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div class="pb" id="pb-${job_id}"></div></div><div class="pm"><span id="pc-${job_id}">Queued…</span><span id="pp-${job_id}">0%</span></div><div id="logs-${job_id}" class="m-logs" style="display:none"></div><div class="perr" id="pe-${job_id}" style="display:none"></div><button class="pcancel" onclick="cancelJob('${job_id}')">Cancel</button>`;
       document.getElementById('plist').prepend(card);
       const es = new EventSource(`/api/download/${job_id}/progress`);
       es.onmessage = e => {
@@ -1687,24 +1597,7 @@ onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div c
       } catch (e) { console.error('Sync Rules load failed', e); }
     }
 
-    window.stopSync = async (src, dst) => { try { await api('/api/mirror/sync/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_id: src, target_id: dst }) }); toast('Sync stopped', 'ok'); loadSyncRules(); } catch (e) { toast(e.message, 'err'); } };
-
-    window.showMobilePane = (paneName, btnEl) => {
-      document.querySelectorAll('.m-nav-item').forEach(b => b.classList.remove('active'));
-      if (btnEl) btnEl.classList.add('active');
-      else {
-        const idx = ['channels','main','activity','tools'].indexOf(paneName);
-        if (idx >= 0) { const btn = document.querySelectorAll('.m-nav-item')[idx]; if (btn) btn.classList.add('active'); }
-      }
-      const sidebar = document.querySelector('.sidebar'), main = document.querySelector('.main'), pd = document.querySelector('.pd');
-      if (sidebar) sidebar.classList.remove('m-active'); if (main) main.classList.remove('m-active'); if (pd) pd.classList.remove('m-active');
-      const stabs = document.querySelector('.stabs'); if (stabs) stabs.style.display = 'flex';
-      if (paneName === 'channels') { if (sidebar) sidebar.classList.add('m-active'); const tab = document.querySelector('.stab:nth-child(1)'); if (tab) switchSTab('channels', tab); }
-      else if (paneName === 'main') { if (main) main.classList.add('m-active'); updViewport(); }
-      else if (paneName === 'activity') { if (pd) pd.classList.add('m-active'); }
-      else if (paneName === 'tools') { if (sidebar) sidebar.classList.add('m-active'); const tab = document.querySelector('.stab:nth-child(2)'); if (tab) switchSTab('external', tab); }
-    };
-    if (window.innerWidth <= 768) { const main = document.querySelector('.main'); if (main) main.classList.add('m-active'); const btn = document.querySelectorAll('.m-nav-item')[1]; if (btn) showMobilePane('main', btn); }
+    window.stopSync = async (src, dst) => { try { await api('/api/mirror/sync/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_id: src, target_id: dst }) }); toast('Sync stopped', 'ok'); loadSyncRules(); } catch (e) { toast(e.message, "err"); } };
 
     (function() {
       function setupResizer(id, varName, minW, maxW, isRight = false) {
@@ -1726,33 +1619,57 @@ onclick="toggleLogs('${job_id}')">Logs</button></div><div class="pb-wrap"><div c
 
     document.addEventListener('keydown', e => {
       const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
-      if (isInput) { if (e.key === 'Enter' && !e.shiftKey) { if (document.getElementById('va')?.classList.contains('active')) doAuth(); else if (document.getElementById('vo')?.classList.contains('active')) doOtp(); } return; }
-      if (e.key === 'Escape') { lbClose(); hideTruePreview(); }
-      const lb = document.getElementById('lb'); const isLb = lb.classList.contains('active') || lb.classList.contains('open');
-      if (isLb) { if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); lbNav(-1); return; } if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); lbNav(1); return; } return; }
-      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) { e.preventDefault(); peekByKeys(e.key.replace('Arrow', '').toLowerCase(), e); return; }
+      const cp = document.getElementById('cp-overlay');
+      const cpActive = cp && cp.classList.contains('active');
+
+      // Command Palette Trigger
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); toggleCP(); return; }
+
+      if (cpActive) {
+        if (e.key === 'Escape') { e.preventDefault(); closeCP(); return; }
+        // Arrow/Enter handled by input listener for robustness
+        if (['ArrowUp', 'ArrowDown', 'Enter'].includes(e.key)) return; 
+      }
+
+      if (isInput) return;
+
+      if (e.key === 'Escape') { lbClose(); hideTruePreview(); return; }
+      
+      const lb = document.getElementById('lb');
+      const isLb = lb && (lb.classList.contains('active') || lb.classList.contains('open'));
+      
+      if (isLb) {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); lbNav(-1); return; }
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); lbNav(1); return; }
+        return;
+      }
+
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        peekByKeys(e.key.replace('Arrow', '').toLowerCase(), e);
+        return;
+      }
+
       if (e.key === ' ') { e.preventDefault(); const key = filteredKeys[peekIdx]; if (key) openPreview(key); }
       if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) { const key = filteredKeys[peekIdx]; if (key) openPreview(key); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'a') { e.preventDefault(); selAll(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { if (selItems.size) doDl(); }
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); toggleCP(); }
     });
 
     document.getElementById('msearch')?.addEventListener('input', debounce(e => searchMedia(e.target.value), 250));
 
-    function showErr(id, m) { const el = document.getElementById(id); el.textContent = m; el.style.display = 'block'; }
-    function hideErr(id) { document.getElementById(id).style.display = 'none'; }
+    function showErr(id, m) { const el = document.getElementById(id); if (el) { el.textContent = m; el.style.display = 'block'; } }
+    function hideErr(id) { const el = document.getElementById(id); if (el) el.style.display = 'none'; }
 
+    // Final entry point
     (async () => {
       try {
         const r = await api('/api/auth/status');
         if (r.authenticated) { sv('vapp'); initApp(); }
         else sv('va');
         if (window.lucide) lucide.createIcons();
-      } catch {
-        sv('va');
-      }
+      } catch { sv('va'); }
     })();
 
-  })();
-}
+  })(); // Close main IIFE
+} // Close idx-page check
