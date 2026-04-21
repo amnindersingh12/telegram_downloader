@@ -586,6 +586,11 @@ if (document.body.classList.contains('idx-page')) {
           el = makeCard(key, item);
           thumbObs.observe(el);
           el.dataset.obs = '1';
+          
+          // Smooth staggered entry
+          const stagger = (globalIdx % 30) * 15;
+          el.style.animationDelay = stagger + 'ms';
+          
           grid.appendChild(el);
         }
 
@@ -932,28 +937,30 @@ if (document.body.classList.contains('idx-page')) {
       const n = selItems.size;
       const el = document.getElementById('selc');
       if (el) el.textContent = n;
+      
       const bb = document.querySelector('.bb');
-      const sf = document.querySelector('.sf');
       if (bb) {
         if (n > 0) {
-          bb.classList.add('active');
-          if (sf && sf.classList.contains('active')) bb.classList.add('shifted');
-          else bb.classList.remove('shifted');
-        } else { bb.classList.remove('active', 'shifted'); }
+          bb.style.display = 'flex';
+          setTimeout(() => bb.style.opacity = '1', 10);
+        } else {
+          bb.style.opacity = '0';
+          setTimeout(() => bb.style.display = 'none', 400);
+        }
       }
+
       let totalSize = 0;
       selItems.forEach(k => { const it = items.get(k); if (it) totalSize += it.size || 0; });
       const sizeStr = n > 0 ? ` · ${hrSize(totalSize)}` : '';
       const bbc = document.querySelector('.bbc');
       if (bbc) bbc.innerHTML = `<b>${n}</b> item${n !== 1 ? 's' : ''}${sizeStr} selected`;
-      const btn = document.getElementById('dlbtn');
-      if (btn) btn.disabled = n === 0;
+      
       const sa = document.getElementById('selall-btn');
       if (sa) {
         const totalVisible = filteredKeys.length;
         const allSel = totalVisible > 0 && n >= totalVisible;
-        sa.innerHTML = allSel ? '<span>✓</span> Deselect All' : '<span>✓</span> Select All';
-        sa.classList.toggle('all-selected', allSel);
+        sa.innerHTML = allSel ? 'Deselect Universe' : 'Select Universe';
+        sa.classList.toggle('active', allSel);
       }
     }
 
