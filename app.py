@@ -362,10 +362,12 @@ async def get_media(
 async def get_thumb(channel_id: int, msg_id: int):
     # Priority: return instantly if on disk
     key = f"{channel_id}_{msg_id}"
-    t_path = THUMBS_DIR / f"{key}.webp"
-    if t_path.exists():
-        return FileResponse(t_path, media_type="image/webp", 
-                           headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    for ext in (".webp", ".jpg"):
+        t_path = THUMBS_DIR / f"{key}{ext}"
+        if t_path.exists():
+            mime = "image/webp" if ext == ".webp" else "image/jpeg"
+            return FileResponse(t_path, media_type=mime, 
+                               headers={"Cache-Control": "public, max-age=31536000, immutable"})
     
     # Otherwise fetch (high priority)
     thumb_bytes = await _fetch_thumb(channel_id, msg_id)
@@ -656,16 +658,33 @@ async def start_sync(body: MirrorReq):
 @app.post("/api/mirror/sync/stop")
 async def stop_sync(body: MirrorReq):
     c = await _client()
-    src = await _get_entity_robust(c, body.source_id)
-    dst = await _get_entity_robust(c, body.target_id)
-    from telethon import utils
-    sid, tid = utils.get_peer_id(src), utils.get_peer_id(dst)
+    
+    # Try to resolve or use raw IDs
+    sid, tid = None, None
+    try:
+        src = await _get_entity_robust(c, body.source_id)
+        from telethon import utils
+        sid = utils.get_peer_id(src)
+    except:
+        if isinstance(body.source_id, int): sid = body.source_id
+        elif isinstance(body.source_id, str) and body.source_id.lstrip('-').isdigit(): sid = int(body.source_id)
+    
+    try:
+        dst = await _get_entity_robust(c, body.target_id)
+        from telethon import utils
+        tid = utils.get_peer_id(dst)
+    except:
+        if isinstance(body.target_id, int): tid = body.target_id
+        elif isinstance(body.target_id, str) and body.target_id.lstrip('-').isdigit(): tid = int(body.target_id)
 
-    if sid in st.sync_map:
-        st.sync_map[sid].discard(tid)
-        if not st.sync_map[sid]: del st.sync_map[sid]
-    await _db_run(lambda: _db_remove_sync_rule(sid, tid))
-    return {"status": "ok"}
+    if sid is not None and tid is not None:
+        if sid in st.sync_map:
+            st.sync_map[sid].discard(tid)
+            if not st.sync_map[sid]: del st.sync_map[sid]
+        await _db_run(lambda: _db_remove_sync_rule(sid, tid))
+        return {"status": "ok"}
+    
+    raise HTTPException(400, "Could not identify source or target for removal")
 
 
 @app.get("/api/mirror/sync/list")
@@ -729,7 +748,7 @@ async def stream_updates(request: Request):
 
 # ── Gallery data API ─────────────────────────────────────────────────────────
 @app.get("/api/gallery-data")
-async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100, sort: str = "newest") -> list[dict[str, Any]]:
     """Return cached media items with high-performance bulk SQL fetching."""
     if channels:
         ids = [int(x) for x in channels.split(",") if x.strip()]
@@ -740,7 +759,7 @@ async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100) ->
     if not ids: return []
 
     # Optimized bulk query instead of per-channel loop
-    rows = await _db_read(lambda: _db_get_media_bulk(ids, limit=limit, offset=offset))
+    rows = await _db_read(lambda: _db_get_media_bulk(ids, limit=limit, offset=offset, sort=sort))
     result = []
     for row in rows:
         cid = row["channel_id"]
@@ -766,12 +785,6 @@ async def gallery_data(channels: str = "", offset: int = 0, limit: int = 100) ->
 @app.get("/", response_class=HTMLResponse)
 async def index() -> FileResponse:
     return FileResponse("static/index.html")
-
-
-# ── Gallery page ──────────────────────────────────────────────────────────────
-@app.get("/gallery", response_class=HTMLResponse)
-async def gallery() -> FileResponse:
-    return FileResponse("static/gallery.html")
 
 
 

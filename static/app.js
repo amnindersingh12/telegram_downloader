@@ -476,7 +476,8 @@ if (document.body.classList.contains('idx-page')) {
           sbarTxt.textContent = 'Hydrating library...';
           try {
               // Fetch a reasonable chunk for initial view
-              const cacheData = await api(`/api/gallery-data?channels=${ids}&limit=2000`, { timeout: 10000 });
+              const sort = currentSort || 'newest';
+              const cacheData = await api(`/api/gallery-data?channels=${ids}&limit=2000&sort=${sort}`, { timeout: 10000 });
               if (nonce !== loadNonce) return;
               cacheData.forEach(it => {
                   const key = `${it.channel_id}_${it.msg_id}`;
@@ -497,7 +498,7 @@ if (document.body.classList.contains('idx-page')) {
       if (allMediaKeys.length > 0) {
         // Only sort if array is not too massive to avoid UI freeze
         if (allMediaKeys.length < 20000) {
-            allMediaKeys.sort((a, b) => items.get(b).msg_id - items.get(a).msg_id);
+            applyFilters(); // This handles sorting and filtering
         }
         sbarTxt.textContent = `${items.size} items (ready)`;
         updPillCounts(); applyFilters();
@@ -520,7 +521,7 @@ if (document.body.classList.contains('idx-page')) {
             if (fresh.length > 0) {
               cacheBatch(fresh);
               if (allMediaKeys.length < 30000) {
-                allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
+                applyFilters();
               }
               sbarTxt.textContent = `${items.size} items live`;
               updPillCounts(); 
@@ -542,7 +543,7 @@ if (document.body.classList.contains('idx-page')) {
           allMediaKeys.push(key); 
           cacheBatch([d]);
           if (allMediaKeys.length % 100 === 0) { 
-             if (allMediaKeys.length < 30000) allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
+             if (allMediaKeys.length < 30000) applyFilters();
              if (!vsRAF) vsRAF = requestAnimationFrame(() => { vsRAF = null; applyFilters(); });
           }
         }
@@ -698,7 +699,6 @@ if (document.body.classList.contains('idx-page')) {
             if (!mediaRegistry.has(key)) {
               ev.item.key = key; ev.item.hay = (ev.item.filename + ' ' + ev.item.caption).toLowerCase();
               mediaRegistry.set(key, ev.item); items.set(key, ev.item); allMediaKeys.push(key);
-              allMediaKeys.sort((a,b) => items.get(b).msg_id - items.get(a).msg_id);
               requestAnimationFrame(() => applyFilters());
             }
           }
@@ -1222,10 +1222,14 @@ if (document.body.classList.contains('idx-page')) {
         keys.sort((a, b) => {
           const ia = items.get(a), ib = items.get(b);
           if (!ia || !ib) return 0;
-          if (currentSort === 'date-desc') return (ib.date_ts || 0) - (ia.date_ts || 0);
-          if (currentSort === 'date-asc')  return (ia.date_ts || 0) - (ib.date_ts || 0);
-          if (currentSort === 'size-desc') return (ib.size || 0) - (ia.size || 0);
-          if (currentSort === 'size-asc')  return (ia.size || 0) - (ib.size || 0);
+          if (currentSort === 'newest')    return (ib.msg_id || 0) - (ia.msg_id || 0);
+          if (currentSort === 'oldest')    return (ia.msg_id || 0) - (ib.msg_id || 0);
+          if (currentSort === 'size_desc') return (ib.size || 0) - (ia.size || 0);
+          if (currentSort === 'size_asc')  return (ia.size || 0) - (ib.size || 0);
+          if (currentSort === 'title') {
+            const fa = (ia.filename || '').toLowerCase(), fb = (ib.filename || '').toLowerCase();
+            return fa.localeCompare(fb);
+          }
           return 0;
         });
       }
@@ -1297,7 +1301,20 @@ if (document.body.classList.contains('idx-page')) {
     window.openPreview = openPreview;
 
     window.searchMedia = q => { currentSearch = q.toLowerCase(); applyFilters(); };
-    window.sortMedia = by => { currentSort = by; applyFilters(); };
+    window.setSort = by => { 
+        currentSort = by; 
+        const select = document.getElementById('msort');
+        if (select) select.value = by;
+        
+        // If we have items, just re-sort them locally first
+        if (allMediaKeys.length > 0) {
+            applyFilters();
+        }
+        
+        // ALWAYS re-fetch from server to ensure we have the correct top items for the new sort
+        if (selChs.size > 0) loadMedia();
+    };
+    window.sortMedia = window.setSort;
 
     function _preload(idx) {
       if (idx < 0 || idx >= filteredKeys.length) return;
@@ -1340,7 +1357,6 @@ if (document.body.classList.contains('idx-page')) {
       if (viewMode === 'gallery') { selItems.clear(); updSelCount(); document.getElementById('mgrid').style.paddingTop = '0'; document.getElementById('mgrid').style.paddingBottom = '0'; }
       else { updViewport(); }
     };
-    window.openGallery = () => { const ids = [...selChs].join(','); window.open('/gallery' + (ids ? '?channels=' + ids : ''), '_blank'); };
 
     window.doDl = async () => {
       const dItems = [...selItems].map(k => items.get(k)).filter(Boolean);
@@ -1448,7 +1464,8 @@ if (document.body.classList.contains('idx-page')) {
       sbar.style.display = 'flex';
       document.getElementById('sbar-txt').textContent = 'Loading Global Media Library...';
       try {
-        const data = await api('/api/gallery-data?limit=10000');
+        const sort = currentSort || 'newest';
+        const data = await api(`/api/gallery-data?limit=10000&sort=${sort}`);
         data.forEach(it => {
           const key = `${it.channel_id}_${it.msg_id}`;
           mediaRegistry.set(key, it);

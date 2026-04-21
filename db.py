@@ -157,12 +157,22 @@ def _db_get_media(channel_id: int, mtype: str = "all", limit: int = 5000, offset
         return [dict(r) for r in rows]
 
 
-def _db_get_media_bulk(channel_ids: list[int], limit: int = 5000, offset: int = 0) -> list[dict]:
+def _db_get_media_bulk(channel_ids: list[int], limit: int = 5000, offset: int = 0, sort: str = "newest") -> list[dict]:
     with _db_connect() as c:
         if not channel_ids: return []
         placeholders = ",".join(["?"] * len(channel_ids))
+        
+        sort_sqls = {
+            "newest": "msg_id DESC",
+            "oldest": "msg_id ASC",
+            "size_desc": "size DESC",
+            "size_asc": "size ASC",
+            "title": "filename COLLATE NOCASE ASC"
+        }
+        order_by = sort_sqls.get(sort, "msg_id DESC")
+        
         rows = c.execute(
-            f"SELECT * FROM media WHERE channel_id IN ({placeholders}) ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
+            f"SELECT * FROM media WHERE channel_id IN ({placeholders}) ORDER BY {order_by} LIMIT {limit} OFFSET {offset}",
             channel_ids
         ).fetchall()
         return [dict(r) for r in rows]

@@ -16,6 +16,38 @@ from telethon import TelegramClient, errors, events, utils
 
 logger = logging.getLogger("tgrab")
 
+
+def _is_file_ref_error(exc: Exception) -> bool:
+    """Check if an exception is a Telegram file reference expiry/invalid error.
+    Handles both the specific error class (Telethon >= 1.24) and string fallback."""
+    for cls_name in ('FileReferenceExpiredError', 'FileReferenceInvalidError'):
+        cls = getattr(errors, cls_name, None)
+        if cls and isinstance(exc, cls):
+            return True
+    msg = str(exc).lower()
+    return 'file reference' in msg and ('expired' in msg or 'invalid' in msg)
+
+
+def _msg_fingerprint(msg) -> Optional[str]:
+    """Generate a content fingerprint for deduplication.
+    Uses Telegram's internal media IDs for media, text hash for text-only."""
+    if not msg:
+        return None
+    # Media fingerprint: Telegram's unique media ID (survives forwards/copies)
+    photo = getattr(msg, 'photo', None)
+    if photo and hasattr(photo, 'id'):
+        return f"photo_{photo.id}"
+    doc = getattr(msg, 'document', None)
+    if doc and hasattr(doc, 'id'):
+        return f"doc_{doc.id}"
+    # Text-only: hash the content
+    text = (getattr(msg, 'message', None) or "").strip()
+    if text:
+        import hashlib
+        return f"text_{hashlib.md5(text.encode()).hexdigest()}"
+    return None
+
+
 # ── LRU thumb cache ───────────────────────────────────────────────────────────
 class LRU:
     def __init__(self, maxsize: int = THUMB_CACHE_SIZE):
@@ -70,7 +102,14 @@ async def _on_new_message(event):
             try:
                 if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): continue
                 try:
-                    await event.client.send_message(dst_id, m, comment_to=None)
+                    try:
+                        await event.client.send_message(dst_id, m, comment_to=None)
+                    except Exception as _fre:
+                        if not _is_file_ref_error(_fre): raise
+                        # Re-fetch message for fresh file references
+                        m = await event.client.get_messages(src_id, ids=m.id)
+                        if not m: continue
+                        await event.client.send_message(dst_id, m, comment_to=None)
                 except errors.ChatForwardsRestrictedError:
                     if m.media:
                         from io import BytesIO
@@ -148,6 +187,12 @@ async def _client() -> TelegramClient:
 
 async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
     """Try to get entity. If ID-based lookups fail, sweep dialogs to find and cache it."""
+    # Normalize ID-like strings to integers
+    if isinstance(peer, str):
+        clean = peer.lstrip('-')
+        if clean.isdigit():
+            peer = int(peer)
+
     # 1. Memory Cache
     if isinstance(peer, (int, float)) and int(peer) in st.entity_cache:
         return st.entity_cache[int(peer)]
@@ -162,9 +207,6 @@ async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
         pid = 0
         if isinstance(peer, (int, float)):
             is_id = True; pid = int(peer)
-        elif isinstance(peer, str):
-            clean = peer.lstrip('-')
-            if clean.isdigit(): is_id = True; pid = int(peer)
         
         if is_id:
             # Prevent repetitive sweeps for known missing IDs
@@ -348,12 +390,14 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
     if data: return data
     
     # 2. Disk (Persistent)
-    if t_path.exists():
-        try:
-            data = t_path.read_bytes()
-            st.thumbs.set(key, data)
-            return data
-        except Exception: pass
+    for ext in (".webp", ".jpg"):
+        p = THUMBS_DIR / f"{key}{ext}"
+        if p.exists():
+            try:
+                data = p.read_bytes()
+                st.thumbs.set(key, data)
+                return data
+            except: pass
         
     # 3. Telegram — try stripped thumb first (no download, instant)
     async with _thumb_sem:
@@ -441,8 +485,8 @@ async def _thumb_worker():
             cid, mid = await st.thumb_queue.get()
             try:
                 # Direct check first before calling expensive _fetch_thumb
-                t_path = THUMBS_DIR / f"{cid}_{mid}.webp"
-                if not t_path.exists():
+                has_thumb = any((THUMBS_DIR / f"{cid}_{mid}{ext}").exists() for ext in (".webp", ".jpg"))
+                if not has_thumb:
                     await _fetch_thumb(cid, mid)
             except errors.FloodWaitError as e:
                 logger.warning(f"Thumb pre-fetch rate limited, pausing {e.seconds}s")
@@ -487,10 +531,9 @@ async def _media_sse(
             batch = [dict(r, size_readable=_hr_size(r["size"])) for r in cached]
             yield f"data: {json.dumps({'batch': batch})}\n\n"
             
-            # Pre-fetch only missing thumbnails for cached items
             for r in cached:
-                t_path = THUMBS_DIR / f"{cid}_{r['msg_id']}.webp"
-                if not t_path.exists():
+                has_thumb = any((THUMBS_DIR / f"{cid}_{r['msg_id']}{ext}").exists() for ext in (".webp", ".jpg"))
+                if not has_thumb:
                     st.thumb_queue.put_nowait((cid, r["msg_id"]))
         
         # Then fetch only NEW messages since last cached
@@ -519,8 +562,8 @@ async def _media_sse(
                 # Trigger thumb pre-fetch for the batch
                 for i in buf:
                     if i.get("has_media"):
-                        t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.webp"
-                        if not t_path.exists():
+                        has_thumb = any((THUMBS_DIR / f"{cid}_{i['msg_id']}{ext}").exists() for ext in (".webp", ".jpg"))
+                        if not has_thumb:
                             st.thumb_queue.put_nowait((cid, i['msg_id']))
                 buf.clear()
 
@@ -528,8 +571,8 @@ async def _media_sse(
             await _db_run(lambda b=list(buf): _db_cache_media_batch(b))
             for i in buf:
                 if i.get("has_media"):
-                    t_path = THUMBS_DIR / f"{cid}_{i['msg_id']}.webp"
-                    if not t_path.exists():
+                    has_thumb = any((THUMBS_DIR / f"{cid}_{i['msg_id']}{ext}").exists() for ext in (".webp", ".jpg"))
+                    if not has_thumb:
                         st.thumb_queue.put_nowait((cid, i["msg_id"]))
             buf.clear()
 
@@ -724,7 +767,7 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
             # Auto-upsert status to DB
             asyncio.create_task(_db_run(lambda: _db_upsert_mirror({
                 "id": job_id, "source_id": src_id, "target_id": dst_id,
-                "status": job["status"], "total": job["total"], "current": job.get("current"),
+                "status": job["status"], "total": job["total"], "current": job.get("done", 0),
                 "last_msg_id": job.get("last_msg_id", 0),
                 "logs": job.get("logs", [])
             })))
@@ -749,7 +792,24 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
             return
 
         job["total"] = len(msgs)
-        log(f"Found {len(msgs)} messages. Starting clone...")
+        log(f"Found {len(msgs)} messages. Scanning destination for duplicates...", force=True)
+        
+        # 2. Pre-flight dedup: scan destination for already-present content
+        dst_fingerprints = set()
+        try:
+            scan_limit = min(len(msgs) * 2, 15000)
+            async for dm in c.iter_messages(dst, limit=scan_limit):
+                if cancel.is_set(): break
+                fp = _msg_fingerprint(dm)
+                if fp:
+                    dst_fingerprints.add(fp)
+        except Exception as e:
+            log(f"⚠ Destination scan partial: {e}")
+        
+        if dst_fingerprints:
+            log(f"Found {len(dst_fingerprints)} existing items in destination (dedup active)", force=True)
+        else:
+            log("Destination is clean. Starting clone...", force=True)
         
         # 2. Clone loop
         i = 0
@@ -757,20 +817,43 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
             m = msgs[i]
             if cancel.is_set(): break
             
-            # Deduplication Check
+            # Deduplication Check (DB mapping + content fingerprint)
             if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)):
-                log(f"Skipping duplicate msg {m.id}")
+                log(f"Skipping duplicate msg {m.id} (DB)")
+                i += 1
+                job["done"] = i
+                job["pct"] = round(i / job["total"] * 100, 1)
+                continue
+            
+            fp = _msg_fingerprint(m)
+            if fp and fp in dst_fingerprints:
+                log(f"Skipping msg {m.id} (already in destination)")
+                # Back-fill DB mapping so future runs skip instantly
+                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
                 i += 1
                 job["done"] = i
                 job["pct"] = round(i / job["total"] * 100, 1)
                 continue
 
             try:
-                # as_copy=True fallback via send_message
-                await c.send_message(dst, m, comment_to=None)
+                # Send with automatic file reference refresh on expiry
+                try:
+                    await c.send_message(dst, m, comment_to=None)
+                except Exception as _fre:
+                    if not _is_file_ref_error(_fre): raise
+                    log(f"⟳ File ref expired for msg {m.id}, refreshing...")
+                    m = await c.get_messages(src, ids=m.id)
+                    if not m:
+                        log(f"⚠ Msg {msgs[i].id} no longer exists, skipping")
+                        i += 1; job["done"] = i; job["pct"] = round(i / job["total"] * 100, 1)
+                        continue
+                    msgs[i] = m
+                    await c.send_message(dst, m, comment_to=None)
                 sz = _hr_size(_size(m)) if m.media else "text"
                 log(f"Cloned msg {m.id} ({sz})")
                 await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+                # Track fingerprint to prevent intra-batch duplicates
+                if fp: dst_fingerprints.add(fp)
             except errors.ChatForwardsRestrictedError:
                 sz = _hr_size(_size(m)) if m.media else "text"
                 log(f"Msg {m.id} is protected ({sz}). Re-uploading...")
@@ -779,7 +862,19 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
                     import mimetypes
                     bio = BytesIO()
                     log(f" ↓ Downloading msg {m.id} to buffer...")
-                    await c.download_media(m, bio)
+                    try:
+                        await c.download_media(m, bio)
+                    except Exception as _fre:
+                        if not _is_file_ref_error(_fre): raise
+                        log(f"⟳ File ref expired during download, refreshing...")
+                        m = await c.get_messages(src, ids=m.id)
+                        if not m:
+                            log(f"⚠ Msg deleted from source, skipping")
+                            i += 1; job["done"] = i; job["pct"] = round(i / job["total"] * 100, 1)
+                            continue
+                        msgs[i] = m
+                        bio = BytesIO()
+                        await c.download_media(m, bio)
                     bio.seek(0)
                     
                     # 1. Try m.file.name (strongest)
@@ -812,6 +907,7 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
                 
                 # Save mapping to prevent future duplicates
                 await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+                if fp: dst_fingerprints.add(fp)
             except errors.FloodWaitError as e:
                 log(f"⚠ Rate limited: waiting {e.seconds}s...")
                 await asyncio.sleep(e.seconds)
@@ -852,17 +948,23 @@ async def _restore_jobs():
     # We iterate reversed (newest first) to prioritize fresh jobs
     for r in sorted(rows, key=lambda x: x["id"], reverse=True):
         jid = r["id"]
-        total = r["total"] or 0
-        current = r["current"] or 0
+        
+        def _safe_int(v):
+            try: return int(v) if v is not None else 0
+            except: return 0
+
+        total = _safe_int(r["total"])
+        current_num = _safe_int(r["current"])
+        
         job = {
             "id": jid, "source_id": r["source_id"], "target_id": r["target_id"],
             "status": r["status"],
             "type": "mirror",
             "total": total,
-            "done": current if r["status"] == "done" else 0,
-            "current": None,
+            "done": current_num if r["status"] == "done" else 0,
+            "current": r["current"] if isinstance(r["current"], str) and not r["current"].isdigit() else None,
             "logs": json.loads(r["logs"] or '[]'),
-            "pct": round(current / total * 100, 1) if total > 0 else 0
+            "pct": round(current_num / total * 100, 1) if total > 0 else 0
         }
         
         if jid == "sync_activity":
