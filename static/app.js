@@ -234,14 +234,53 @@ if (document.body.classList.contains('idx-page')) {
         if (d.logs) updateMirrorLogs('sync_activity', d.logs);
       };
 
-      document.getElementById('chlist').innerHTML =
-        '<div style="padding:8px;display:grid;gap:6px">' +
-        '<div class="sk" style="height:56px"></div>'.repeat(5) + '</div>';
+      // System logs stream
+      const logContainer = document.getElementById('system-logs');
+      if (logContainer) {
+        const esLogs = new EventSource('/api/logs/stream');
+        esLogs.onmessage = e => {
+          if (e.data.startsWith(':')) return;
+          try {
+            const d = JSON.parse(e.data);
+            if (d.log) {
+              const div = document.createElement('div');
+              const parts = d.log.split(' ');
+              const level = (parts[2] || 'INFO').toUpperCase();
+              div.className = 'log-line ' + (['INFO','WARN','ERROR'].includes(level) ? level : 'INFO');
+              div.textContent = d.log;
+              logContainer.appendChild(div);
+              if (logContainer.childNodes.length > 200) logContainer.removeChild(logContainer.firstChild);
+              logContainer.scrollTop = logContainer.scrollHeight;
+            }
+          } catch(err) { console.debug('Log parse error', err); }
+        };
+        esLogs.onerror = () => { console.warn('Log stream lost'); };
+      }
+
+      if (allChs.length === 0) {
+        document.getElementById('chlist').innerHTML =
+          '<div style="padding:8px;display:grid;gap:6px">' +
+          '<div class="sk" style="height:56px"></div>'.repeat(5) + '</div>';
+      }
       renderFolderTabs();
+      loadChannelsSSE();
+      updViewport();
+      startLiveUpdates();
+    }
+
+    let chES = null;
+    function loadChannelsSSE() {
+      if (chES) chES.close();
       const es = new EventSource('/api/channels');
+      chES = es;
       let chRenderPending = false;
       es.onmessage = e => {
         const d = JSON.parse(e.data);
+        if (d.error) {
+            console.error('Channel Stream Error:', d.error);
+            toast(d.error, 'err');
+            return;
+        }
         if (d.folder_list) {
           folders = d.folder_list;
           renderFolderTabs();
@@ -249,21 +288,50 @@ if (document.body.classList.contains('idx-page')) {
         }
         if (d.done) { 
           es.close(); 
+          chES = null;
           renderChannelList(); 
           cacheChannels(allChs);
           return; 
         }
-        // Deduplicate: remove if exists, then push (to update)
-        allChs = allChs.filter(c => c.id !== d.id);
-        allChs.push(d);
+        // Deduplicate and update
+        const idx = allChs.findIndex(c => c.id === d.id);
+        if (idx !== -1) {
+          allChs[idx] = { ...allChs[idx], ...d };
+        } else {
+          allChs.push(d);
+        }
+        
         if (!chRenderPending) {
           chRenderPending = true;
           requestAnimationFrame(() => { chRenderPending = false; renderChannelList(); });
         }
       };
-      es.onerror = () => es.close();
-      updViewport();
-      startLiveUpdates();
+      es.onerror = (e) => { 
+        console.error('Channel SSE Error:', e);
+        es.close(); 
+        chES = null; 
+      };
+    }
+
+    function renderFolderTabs() {
+      const box = document.getElementById('ftabs');
+      if (!box) return;
+
+      const unreadCount = allChs.filter(c => (c.unread || 0) > 0).length;
+      
+      let html = `<button class="ftab ${activeFolder === '' ? 'active' : ''}" onclick="setFolder('')">All</button>`;
+      
+      if (unreadCount > 0) {
+        html += `<button class="ftab ${activeFolder === 'unread' ? 'active' : ''}" onclick="setFolder('unread')">Unread (${unreadCount})</button>`;
+      }
+
+      folders.forEach(f => {
+        const name = typeof f === 'string' ? f : f.name;
+        const emoji = typeof f === 'string' ? '' : (f.emoji || '');
+        html += `<button class="ftab ${activeFolder === name ? 'active' : ''}" onclick="setFolder('${name}')">${emoji} ${name}</button>`;
+      });
+
+      box.innerHTML = html;
     }
 
     // ── Previews & Hover Interactions ───────────────────────────────────
@@ -507,9 +575,27 @@ if (document.body.classList.contains('idx-page')) {
       // 3. Revalidation Stream (only fetches what's missing)
       stream = new EventSource(`/api/media?channels=${ids}&type=all`);
 
+      stream.onerror = (e) => {
+          console.error('Media stream failed:', e);
+          toast('Media connection lost. Retrying...', 'err');
+          stream.close();
+          stream = null;
+          // Auto-retry once after 2 seconds
+          setTimeout(() => { if (nonce === loadNonce) loadMedia(chs); }, 2000);
+      };
+      
       stream.onmessage = e => {
         if (nonce !== loadNonce) { stream.close(); return; }
         const d = JSON.parse(e.data);
+        if (d.status) {
+            document.getElementById('sbar-txt').textContent = d.status;
+            return;
+        }
+        if (d.error) {
+            console.error('Media Stream Error:', d.error);
+            toast(d.error, 'err');
+            return;
+        }
         if (d.batch) {
           const fresh = [];
           d.batch.forEach(item => {
@@ -694,6 +780,10 @@ if (document.body.classList.contains('idx-page')) {
         if (ev.type === 'new_message') {
           const ch = allChs.find(c => c.id === ev.channel_id);
           if (ch) { ch.unread = (ch.unread || 0) + 1; renderChannelList(); }
+          else {
+            // New channel join detected automatically via message
+            loadChannelsSSE();
+          }
           if (ev.item && selChs.has(ev.channel_id)) {
             const key = `${ev.item.channel_id}_${ev.item.msg_id}`;
             if (!mediaRegistry.has(key)) {
@@ -756,6 +846,7 @@ if (document.body.classList.contains('idx-page')) {
       const list = document.getElementById('chlist');
       if (!list) return;
 
+      renderFolderTabs();
       list.innerHTML = '';
       const searchQ = (document.querySelector('#sp-channels .sw input')?.value || '').toLowerCase();
       let filtered = allChs;
@@ -766,8 +857,8 @@ if (document.body.classList.contains('idx-page')) {
         // Show ONLY unread channels
         filtered = filtered.filter(c => (c.unread || 0) > 0);
       } else if (activeFolder === '') {
-        // All view: Show ONLY read channels (per user request)
-        filtered = filtered.filter(c => (c.unread || 0) === 0);
+        // All view: Show ALL channels
+        // (Removing the old "read only" filter as it confused users)
       } else {
         // Custom folder view
         filtered = filtered.filter(c => c.folders && c.folders.includes(activeFolder));
@@ -864,12 +955,12 @@ if (document.body.classList.contains('idx-page')) {
     }
 
     window.selectChannel = (id) => {
-      const numId = typeof id === 'string' ? parseInt(id) : id;
+      // Normalize to number if it's a numeric string
+      const numId = (typeof id === 'string' && /^-?\d+$/.test(id)) ? parseInt(id) : id;
       selChs.clear();
-      selChs.add(id); // Use original for Set
-      if (!isNaN(numId)) selChs.add(numId); // Dual-support for ID types
+      selChs.add(numId);
 
-      lastSelChId = id;
+      lastSelChId = numId;
       switchSTab('channels');
       updSelAllBtn();
       renderChannelList();

@@ -10,7 +10,7 @@ _local = threading.local()
 
 def _db_connect() -> sqlite3.Connection:
     if not hasattr(_local, "conn"):
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         # Enable WAL for new connections too
         conn.execute("PRAGMA journal_mode=WAL")
@@ -30,7 +30,8 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY, type TEXT, title TEXT,
             username TEXT, members INTEGER, can_post INTEGER,
-            unread INTEGER DEFAULT 0, folders TEXT DEFAULT '[]'
+            unread INTEGER DEFAULT 0, folders TEXT DEFAULT '[]',
+            cached_at REAL
         );
         CREATE TABLE IF NOT EXISTS media (
             channel_id INTEGER, msg_id INTEGER, type TEXT,
@@ -113,16 +114,25 @@ async def _db_read(fn: Callable) -> Any:
 def _db_upsert_channel(ch: dict) -> None:
     with _db_connect() as c:
         c.execute(
-            "INSERT OR REPLACE INTO channels VALUES (?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO entities (id, title, type, members, username, unread, folders, can_post, cached_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (ch["id"], ch["title"], ch["type"], ch.get("members"),
-             ch.get("username"), datetime.now().timestamp()),
+             ch.get("username"), ch.get("unread", 0), json.dumps(ch.get("folders", [])),
+             int(ch.get("can_post", False)), datetime.now().timestamp()),
         )
 
 
 def _db_get_channels() -> list[dict]:
     with _db_connect() as c:
-        rows = c.execute("SELECT * FROM channels ORDER BY title").fetchall()
-        return [dict(r) for r in rows]
+        rows = c.execute("SELECT * FROM entities ORDER BY title").fetchall()
+        res = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["folders"] = json.loads(d.get("folders", "[]"))
+            except:
+                d["folders"] = []
+            res.append(d)
+        return res
 
 
 def _db_cache_media(item: dict) -> None:

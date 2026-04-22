@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, re, sys
+import asyncio, base64, json, logging, os, re, sys
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,12 +216,19 @@ async def _get_entity_robust(client: TelegramClient, peer: Any) -> Any:
                 logger.warning(f"Entity {pid} not found; skipping sweep (too soon)")
                 raise errors.PeerIdInvalidError(None)
 
-            st._last_sweep = now
-            logger.info(f"Entity {pid} not in cache — sweeping dialogs...")
-            async for d in client.iter_dialogs(limit=None):
+            logger.info(f"Entity {pid} not in cache — sweeping recent dialogs...")
+            count = 0
+            async for d in client.iter_dialogs(limit=500):
                 st.entity_cache[d.id] = d.entity
                 if d.id == pid:
+                    st._last_sweep = datetime.now().timestamp() # Successful sweep
                     return d.entity
+                count += 1
+                if count % 100 == 0:
+                    logger.info(f"Swept {count} dialogs...")
+            
+            st._last_sweep = datetime.now().timestamp() # Failed sweep
+            logger.warning(f"Entity {pid} not found in 500 dialogs.")
         raise errors.PeerIdInvalidError(None)
 
 
@@ -304,24 +311,24 @@ def _hr_size(n: int) -> str:
 
 def _get_stripped_thumb(msg: Any) -> Optional[str]:
     """Extract and convert Telegram's PhotoStrippedSize to a usable base64 JPG."""
-    from telethon.utils import stripped_to_jpg
+    from telethon.utils import stripped_photo_to_jpg
     media = getattr(msg, "media", None)
     if not media: return None
     
     photo = getattr(msg, "photo", None)
     doc = getattr(msg, "document", None)
     
-    sizes = []
-    if photo: sizes = getattr(photo, "sizes", [])
-    elif doc: sizes = getattr(doc, "thumbs", [])
-    
-    for s in sizes:
-        if isinstance(s, types.PhotoStrippedSize):
-            try:
-                import base64
-                return base64.b64encode(stripped_to_jpg(s.bytes)).decode()
-            except:
-                pass
+    try:
+        if photo:
+            for size in photo.sizes:
+                if isinstance(size, types.PhotoStrippedSize):
+                    return base64.b64encode(stripped_photo_to_jpg(size.bytes)).decode()
+        if doc:
+            for size in doc.thumbs:
+                if isinstance(size, types.PhotoStrippedSize):
+                    return base64.b64encode(stripped_photo_to_jpg(size.bytes)).decode()
+    except Exception:
+        pass
     return None
 
 
@@ -412,37 +419,12 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
                 photo = getattr(media, 'photo', None) or getattr(media, 'document', None)
                 if photo:
                     for sz in getattr(photo, 'thumbs', []) or []:
-                        if hasattr(sz, 'bytes') and sz.bytes:
-                            # PhotoStrippedSize — reconstruct JPEG
-                            raw = sz.bytes
-                            if len(raw) > 0 and raw[0] == 1:
-                                # Stripped format: needs JPEG header/footer
-                                header = bytes([
-                                    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
-                                    0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-                                    0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-                                    0x00, 0x28, 0x1C, 0x1E, 0x23, 0x1E, 0x19, 0x28,
-                                    0x23, 0x21, 0x23, 0x2D, 0x2B, 0x28, 0x30, 0x3C,
-                                    0x64, 0x41, 0x3C, 0x37, 0x37, 0x3C, 0x7B, 0x58,
-                                    0x5D, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8F,
-                                    0x80, 0x8C, 0x8A, 0xA0, 0xB4, 0xE6, 0xC3, 0xA0,
-                                    0xAA, 0xDA, 0xAD, 0x8A, 0x8C, 0xC8, 0xFF, 0xCB,
-                                    0xDA, 0xEE, 0xF5, 0xFF, 0xFF, 0xFF, 0x9B, 0xC1,
-                                    0xFF, 0xFF, 0xFF, 0xFA, 0xFF, 0xE6, 0xFD, 0xFF,
-                                    0xF8, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x2B, 0x2D,
-                                    0x2D, 0x3C, 0x35, 0x3C, 0x76, 0x41, 0x41, 0x76,
-                                    0xF8, 0xA5, 0x8C, 0xA5, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                    0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
-                                ])
-                                footer = bytes([0xFF, 0xD9])
-                                thumb_bytes = header + raw[3:] + footer
-                            else:
-                                thumb_bytes = raw
+                        # PhotoStrippedSize — reconstruct JPEG using Telethon utility
+                        if isinstance(sz, types.PhotoStrippedSize):
+                            from telethon.utils import stripped_photo_to_jpg
+                            thumb_bytes = stripped_photo_to_jpg(sz.bytes)
+                        elif hasattr(sz, 'bytes') and sz.bytes:
+                            thumb_bytes = sz.bytes
                             break
 
             if not thumb_bytes:
@@ -463,9 +445,9 @@ async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
                         t_path.write_bytes(thumb_webp)
                         return thumb_webp
                 except Exception as e:
-                    logger.warning(f"WebP conversion failed, saving raw: {e}")
+                    magic = thumb_bytes[:16].hex() if thumb_bytes else "None"
+                    logger.warning(f"WebP conversion failed (Magic: {magic}), saving raw: {e}")
                     st.thumbs.set(key, thumb_bytes)
-                    # Save as webp anyway to keep extension consistent, or just fallback
                     t_path.write_bytes(thumb_bytes)
                     return thumb_bytes
         except Exception as e:
@@ -516,11 +498,13 @@ async def _media_sse(
 
     for cid in channel_ids:
         try:
+            # Send status update for entity resolution
+            yield f"data: {json.dumps({'status': f'Opening channel {cid}...'})}\n\n"
             # Marked IDs (negative) allow get_entity to perfectly resolve from session cache
             entity = await _get_entity_robust(c, cid)
         except Exception as e:
             logger.error(f"Could not resolve entity for ID {cid}: {e}")
-            yield f"data: {json.dumps({'error': str(e), 'channel_id': cid})}\n\n"
+            yield f"data: {json.dumps({'error': f'Could not open channel {cid}: {str(e)}'})}\n\n"
             continue
 
         # Check cache first for this channel
@@ -545,7 +529,12 @@ async def _media_sse(
                                           min_id=min_id):
             if await request.is_disconnected():
                 return
-            item = _msg_to_item(msg, cid)
+            try:
+                item = _msg_to_item(msg, cid)
+            except Exception as e:
+                logger.error(f"Error processing message {msg.id} in {cid}: {e}", exc_info=True)
+                continue
+                
             if not item:
                 continue
             
@@ -556,6 +545,11 @@ async def _media_sse(
             if len(new_batch) >= 50:
                 yield f"data: {json.dumps({'batch': new_batch})}\n\n"
                 new_batch = []
+
+            # Send a progress ping every 200 items scanned even if not yielded yet
+            if (len(buf) + len(new_batch)) % 200 == 0:
+                # Use a dummy key or just a status string
+                yield f"data: {json.dumps({'status': f'Scanning... (found {len(buf) + len(new_batch)} items)'})}\n\n"
 
             if len(buf) >= 100:
                 await _db_run(lambda b=list(buf): _db_cache_media_batch(b))

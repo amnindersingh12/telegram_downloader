@@ -6,13 +6,14 @@
 #   "fastapi>=0.115",
 #   "uvicorn[standard]>=0.32",
 #   "yt-dlp",
+#   "Pillow",
 # ]
 # ///
 """
 TGrab — High-performance Telegram Media Downloader
 
 Purpose:
-  A unified streaming and downloading interface for Telegram media. Supports
+  A unified streaming and downloading interface for Telegram media. Sand upports
   instant previews, mosaic gallery views, and batch background downloads.
 
 Dependencies:
@@ -35,8 +36,6 @@ Configuration:
 import asyncio, json, logging, os, re, sqlite3, subprocess, sys, uuid, webbrowser, mimetypes
 from collections import OrderedDict
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger("tgrab")
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +55,23 @@ from telethon.tl.types import (
     InputMessagesFilterVideo,
     InputMessagesFilterDocument,
 )
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_queue = asyncio.Queue()
+
+class SSEHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(log_queue.put_nowait, log_entry)
+        except Exception:
+            pass
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger("tgrab")
+logger.addHandler(SSEHandler())
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
@@ -178,6 +194,24 @@ async def get_health():
         "jobs": len(st.jobs)
     }
 
+@app.get("/api/logs/stream")
+async def stream_system_logs(request: Request):
+    async def log_gen():
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                # Wait for new log message with timeout to check for disconnect
+                log = await asyncio.wait_for(log_queue.get(), timeout=5.0)
+                yield f"data: {json.dumps({'log': log})}\n\n"
+            except asyncio.TimeoutError:
+                # Keepalive ping
+                yield ": ping\n\n"
+            except Exception:
+                break
+            
+    return StreamingResponse(log_gen(), media_type="text/event-stream")
+
 @app.post("/api/cache/wipe")
 async def wipe_cache():
     """Clear all cached media and entities to allow a clean re-scan."""
@@ -185,7 +219,6 @@ async def wipe_cache():
         with _db_connect() as c:
             c.execute("DELETE FROM media")
             c.execute("DELETE FROM entities")
-            c.execute("DELETE FROM channels")
     await _db_run(_wipe)
     # Also clear in-memory state
     st.entity_cache.clear()
@@ -317,6 +350,9 @@ async def stream_channels(request: Request):
                 continue
             
             m_id = utils.get_peer_id(e)
+            
+            # Proactively cache the entity for faster media loading later
+            st.entity_cache[m_id] = e
             
             is_creator = getattr(e, "creator", False)
             admin_rights = getattr(e, "admin_rights", None)
