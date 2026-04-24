@@ -98,18 +98,19 @@ async def _on_new_message(event):
     # ── 1. Live Sync / Mirroring ───────────────────────────────────────────
     if src_id in st.sync_map:
         targets = st.sync_map[src_id]
-        for dst_id in targets:
+        
+        async def sync_target(dst_id):
             try:
-                if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): continue
+                if await _db_run(lambda d=dst_id: _db_is_mirrored(src_id, m.id, d)): return
                 try:
                     try:
                         await event.client.send_message(dst_id, m, comment_to=None)
                     except Exception as _fre:
                         if not _is_file_ref_error(_fre): raise
                         # Re-fetch message for fresh file references
-                        m = await event.client.get_messages(src_id, ids=m.id)
-                        if not m: continue
-                        await event.client.send_message(dst_id, m, comment_to=None)
+                        fresh_m = await event.client.get_messages(src_id, ids=m.id)
+                        if not fresh_m: return
+                        await event.client.send_message(dst_id, fresh_m, comment_to=None)
                 except errors.ChatForwardsRestrictedError:
                     if m.media:
                         from io import BytesIO
@@ -117,9 +118,9 @@ async def _on_new_message(event):
                         bio = BytesIO()
                         await event.client.download_media(m, bio)
                         bio.seek(0)
-                        fn = m.file.name
+                        fn = getattr(getattr(m, 'file', None), 'name', None)
                         doc = getattr(m.media, 'document', None)
-                        if not fn and doc and doc.mime_type:
+                        if not fn and doc and getattr(doc, 'mime_type', None):
                             ex = mimetypes.guess_extension(doc.mime_type)
                             if ex: fn = f"sync_{m.id}{ex}"
                         bio.name = fn or f"sync_{m.id}"
@@ -132,6 +133,10 @@ async def _on_new_message(event):
                 st.jobs["sync_activity"]["logs"] = (st.jobs["sync_activity"].get("logs", []) + [log_msg])[-500:]
             except Exception as e:
                 logger.error(f"Live Sync Error: {e}")
+
+        # Run all sync targets concurrently
+        if targets:
+            await asyncio.gather(*(sync_target(t) for t in targets))
 
     # ── 2. Notify connected clients (Unified Updates) ──────────────────────
     item = _msg_to_item(m, src_id)
@@ -806,115 +811,126 @@ async def _run_mirror(job_id: str, src_id: int, dst_id: int, limit: Optional[int
             log("Destination is clean. Starting clone...", force=True)
         
         # 2. Clone loop
-        i = 0
-        while i < len(msgs):
-            m = msgs[i]
-            if cancel.is_set(): break
-            
-            # Deduplication Check (DB mapping + content fingerprint)
-            if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)):
-                log(f"Skipping duplicate msg {m.id} (DB)")
-                i += 1
-                job["done"] = i
-                job["pct"] = round(i / job["total"] * 100, 1)
-                continue
-            
-            fp = _msg_fingerprint(m)
-            if fp and fp in dst_fingerprints:
-                log(f"Skipping msg {m.id} (already in destination)")
-                # Back-fill DB mapping so future runs skip instantly
-                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
-                i += 1
-                job["done"] = i
-                job["pct"] = round(i / job["total"] * 100, 1)
-                continue
+        sem = asyncio.Semaphore(10)
+        clone_lock = asyncio.Lock()
+        done_count = 0
+        tasks = []
 
+        async def process_msg(m):
+            nonlocal done_count
             try:
-                # Send with automatic file reference refresh on expiry
-                try:
-                    await c.send_message(dst, m, comment_to=None)
-                except Exception as _fre:
-                    if not _is_file_ref_error(_fre): raise
-                    log(f"⟳ File ref expired for msg {m.id}, refreshing...")
-                    m = await c.get_messages(src, ids=m.id)
-                    if not m:
-                        log(f"⚠ Msg {msgs[i].id} no longer exists, skipping")
-                        i += 1; job["done"] = i; job["pct"] = round(i / job["total"] * 100, 1)
-                        continue
-                    msgs[i] = m
-                    await c.send_message(dst, m, comment_to=None)
-                sz = _hr_size(_size(m)) if m.media else "text"
-                log(f"Cloned msg {m.id} ({sz})")
-                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
-                # Track fingerprint to prevent intra-batch duplicates
-                if fp: dst_fingerprints.add(fp)
-            except errors.ChatForwardsRestrictedError:
-                sz = _hr_size(_size(m)) if m.media else "text"
-                log(f"Msg {m.id} is protected ({sz}). Re-uploading...")
-                if m.media:
-                    from io import BytesIO
-                    import mimetypes
-                    bio = BytesIO()
-                    log(f" ↓ Downloading msg {m.id} to buffer...")
-                    try:
-                        await c.download_media(m, bio)
-                    except Exception as _fre:
-                        if not _is_file_ref_error(_fre): raise
-                        log(f"⟳ File ref expired during download, refreshing...")
-                        m = await c.get_messages(src, ids=m.id)
-                        if not m:
-                            log(f"⚠ Msg deleted from source, skipping")
-                            i += 1; job["done"] = i; job["pct"] = round(i / job["total"] * 100, 1)
-                            continue
-                        msgs[i] = m
-                        bio = BytesIO()
-                        await c.download_media(m, bio)
-                    bio.seek(0)
-                    
-                    # 1. Try m.file.name (strongest)
-                    fn = m.file.name
-                    
-                    # 2. Try attributes fallback
-                    doc = getattr(m.media, 'document', None)
-                    attrs = doc.attributes if doc else []
-                    if not fn and doc:
-                        for a in attrs:
-                            if hasattr(a, 'file_name'): fn = a.file_name; break
-                    
-                    # 3. Guess extension from mime type
-                    if not fn and doc and doc.mime_type:
-                        ext = mimetypes.guess_extension(doc.mime_type)
-                        if ext: fn = f"file_{m.id}{ext}"
-                    
-                    # 4. Final generic fallbacks
-                    if not fn:
-                        if isinstance(m.media, types.MessageMediaPhoto): fn = f"image_{m.id}.jpg"
-                        else: fn = f"file_{m.id}.dat"
-
-                    bio.name = fn
-                    log(f" ↑ Uploading {fn} to target...")
-                    await c.send_file(dst, bio, caption=m.message, formatting_entities=m.entities, attributes=attrs)
-                    log(f"✅ Re-uploaded: {fn} ({sz})")
-                else:
-                    await c.send_message(dst, m.message, formatting_entities=m.entities)
-                    log(f"✅ Synced text: {m.id}")
+                if cancel.is_set(): return
                 
-                # Save mapping to prevent future duplicates
-                await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
-                if fp: dst_fingerprints.add(fp)
-            except errors.FloodWaitError as e:
-                log(f"⚠ Rate limited: waiting {e.seconds}s...")
-                await asyncio.sleep(e.seconds)
-                continue
-            except Exception as e:
-                log(f"❌ Failed msg {m.id}: {e}")
-            
-            i += 1
-            job["done"] = i
-            job["pct"] = round(i / job["total"] * 100, 1)
-            job["last_msg_id"] = m.id
-            if (i+1) % 5 == 0: log(f"Progress: {i+1}/{len(msgs)}")
-            await asyncio.sleep(0.1) # Faster with high RAM and optimized concurrency
+                # Deduplication Check (DB mapping)
+                if await _db_run(lambda: _db_is_mirrored(src_id, m.id, dst_id)):
+                    log(f"Skipping duplicate msg {m.id} (DB)")
+                    async with clone_lock:
+                        done_count += 1
+                        job["done"] = done_count
+                        job["pct"] = round(done_count / job["total"] * 100, 1)
+                    return
+                
+                fp = _msg_fingerprint(m)
+                async with clone_lock:
+                    if fp and fp in dst_fingerprints:
+                        log(f"Skipping msg {m.id} (already in destination)")
+                        await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+                        done_count += 1
+                        job["done"] = done_count
+                        job["pct"] = round(done_count / job["total"] * 100, 1)
+                        return
+                    if fp: dst_fingerprints.add(fp)
+
+                retries = 3
+                while retries > 0:
+                    if cancel.is_set(): return
+                    try:
+                        # Send with automatic file reference refresh on expiry
+                        try:
+                            await c.send_message(dst, m, comment_to=None)
+                        except Exception as _fre:
+                            if not _is_file_ref_error(_fre): raise
+                            log(f"⟳ File ref expired for msg {m.id}, refreshing...")
+                            refreshed_m = await c.get_messages(src, ids=m.id)
+                            if not refreshed_m:
+                                log(f"⚠ Msg {m.id} no longer exists, skipping")
+                                break
+                            m = refreshed_m
+                            await c.send_message(dst, m, comment_to=None)
+                        
+                        sz = _hr_size(_size(m)) if getattr(m, 'media', None) else "text"
+                        log(f"Cloned msg {m.id} ({sz})")
+                        await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+                        break
+                    except errors.ChatForwardsRestrictedError:
+                        sz = _hr_size(_size(m)) if getattr(m, 'media', None) else "text"
+                        log(f"Msg {m.id} is protected ({sz}). Re-uploading...")
+                        if getattr(m, 'media', None):
+                            from io import BytesIO
+                            import mimetypes
+                            bio = BytesIO()
+                            log(f" ↓ Downloading msg {m.id} to buffer...")
+                            try:
+                                await c.download_media(m, bio)
+                            except Exception as _fre:
+                                if not _is_file_ref_error(_fre): raise
+                                log(f"⟳ File ref expired during download, refreshing...")
+                                refreshed_m = await c.get_messages(src, ids=m.id)
+                                if not refreshed_m:
+                                    log(f"⚠ Msg deleted from source, skipping")
+                                    break
+                                m = refreshed_m
+                                bio = BytesIO()
+                                await c.download_media(m, bio)
+                            bio.seek(0)
+                            
+                            fn = getattr(getattr(m, 'file', None), 'name', None)
+                            doc = getattr(m.media, 'document', None)
+                            attrs = doc.attributes if doc else []
+                            if not fn and doc:
+                                for a in attrs:
+                                    if hasattr(a, 'file_name'): fn = a.file_name; break
+                            if not fn and doc and getattr(doc, 'mime_type', None):
+                                ext = mimetypes.guess_extension(doc.mime_type)
+                                if ext: fn = f"file_{m.id}{ext}"
+                            if not fn:
+                                if isinstance(m.media, types.MessageMediaPhoto): fn = f"image_{m.id}.jpg"
+                                else: fn = f"file_{m.id}.dat"
+
+                            bio.name = fn
+                            log(f" ↑ Uploading {fn} to target...")
+                            await c.send_file(dst, bio, caption=m.message, formatting_entities=m.entities, attributes=attrs)
+                            log(f"✅ Re-uploaded: {fn} ({sz})")
+                        else:
+                            await c.send_message(dst, m.message, formatting_entities=m.entities)
+                            log(f"✅ Synced text: {m.id}")
+                        
+                        await _db_run(lambda: _db_add_mirror_mapping(src_id, m.id, dst_id))
+                        break
+                    except errors.FloodWaitError as e:
+                        log(f"⚠ Rate limited: waiting {e.seconds}s...")
+                        await asyncio.sleep(e.seconds)
+                        retries -= 1
+                    except Exception as e:
+                        log(f"❌ Failed msg {m.id}: {e}")
+                        break
+
+                async with clone_lock:
+                    done_count += 1
+                    job["done"] = done_count
+                    job["pct"] = round(done_count / job["total"] * 100, 1)
+                    job["last_msg_id"] = m.id
+                    if done_count % 5 == 0: log(f"Progress: {done_count}/{job['total']}")
+            finally:
+                sem.release()
+
+        for m in msgs:
+            if cancel.is_set(): break
+            await sem.acquire()
+            tasks.append(asyncio.create_task(process_msg(m)))
+
+        if tasks:
+            await asyncio.gather(*tasks)
 
         job["status"] = "done" if not cancel.is_set() else "cancelled"
         log(f"Job {job['status']}", force=True)

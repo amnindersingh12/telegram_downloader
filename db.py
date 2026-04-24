@@ -111,14 +111,17 @@ async def _db_read(fn: Callable) -> Any:
     return await loop.run_in_executor(None, fn)
 
 
-def _db_upsert_channel(ch: dict) -> None:
+def _db_upsert_channel(ch: dict) -> float:
     with _db_connect() as c:
+        row = c.execute("SELECT cached_at FROM entities WHERE id=?", (ch["id"],)).fetchone()
+        cached_at = row["cached_at"] if row and row["cached_at"] else datetime.now().timestamp()
         c.execute(
             "INSERT OR REPLACE INTO entities (id, title, type, members, username, unread, folders, can_post, cached_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (ch["id"], ch["title"], ch["type"], ch.get("members"),
              ch.get("username"), ch.get("unread", 0), json.dumps(ch.get("folders", [])),
-             int(ch.get("can_post", False)), datetime.now().timestamp()),
+             int(ch.get("can_post", False)), cached_at),
         )
+        return cached_at
 
 
 def _db_get_channels() -> list[dict]:

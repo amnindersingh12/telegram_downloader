@@ -282,6 +282,16 @@
           </div>
         </div>
         <div class="sidebar-pane active" style="overflow-y:auto">
+          <div class="s-section-header">System Logs</div>
+          <div class="ext-item" style="margin: 0 10px 15px 10px; flex-shrink: 0;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px">
+              <div class="ext-url" style="min-width:0;flex:1;font-size:13px" title="System Logs">🖥️ System Runtime</div>
+              <button class="vbtn" style="width:auto;flex-shrink:0;padding:4px 12px;font-size:11px;border-radius:20px;background:var(--accent);border:1px solid var(--accent);color:#fff" onclick="const box = document.getElementById('system-logs'); const isV = box.style.display !== 'none'; box.style.display = isV ? 'none' : 'block'; this.textContent = isV ? 'Show Logs' : 'Hide Logs'; this.style.background = isV ? 'var(--adim)' : 'var(--accent)'; this.style.color = isV ? 'var(--accent)' : '#fff';">Hide Logs</button>
+            </div>
+            <div class="ext-status" style="color:var(--muted)">Streaming log events...</div>
+            <div id="system-logs" class="m-logs" style="display:block; max-height:400px;"></div>
+          </div>
+
           <div class="s-section-header">Downloads</div>
           <div id="plist" style="padding:0 10px"></div>
 
@@ -290,9 +300,6 @@
 
           <div class="s-section-header">Mirroring Status</div>
           <div class="ext-history" id="mir-history" style="padding:0 10px"></div>
-          
-          <div class="s-section-header">System Logs</div>
-          <div id="system-logs" class="system-logs"></div>
         </div>
       </div>
     </div>

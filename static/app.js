@@ -223,16 +223,7 @@ if (document.body.classList.contains('idx-page')) {
       }
 
       
-      // Add sync activity card - if it doesn't exist, it will be prepended (top)
-      if (!document.getElementById('job-sync_activity')) {
-        addMirrorCard('sync_activity', 'Live', 'Sync', 'Running');
-      }
-      
-      const esSync = new EventSource('/api/download/sync_activity/progress');
-      esSync.onmessage = e => {
-        const d = JSON.parse(e.data);
-        if (d.logs) updateMirrorLogs('sync_activity', d.logs);
-      };
+
 
       // System logs stream
       const logContainer = document.getElementById('system-logs');
@@ -870,13 +861,14 @@ if (document.body.classList.contains('idx-page')) {
 
       currentVisibleChs = filtered.map(c => c.id);
       
+      updMirDatalist();
+
       if (!filtered.length) {
         list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No channels</div>';
         return;
       }
 
       filtered.forEach(ch => appendCh(ch, list));
-      updMirDatalist();
     }
 
     function updMirDatalist() {
@@ -884,12 +876,19 @@ if (document.body.classList.contains('idx-page')) {
       const dlTarget = document.getElementById('ch-datalist-target');
       if (!dlAll || !dlTarget) return;
 
-      const items = allChs.map(ch =>
+      const sortedChs = [...allChs].sort((a, b) => {
+        const at = a.cached_at || 0;
+        const bt = b.cached_at || 0;
+        if (bt !== at) return bt - at;
+        return a.title.localeCompare(b.title);
+      });
+
+      const items = sortedChs.map(ch =>
         `<option value="${ch.id}">${esc(ch.title)} (${ch.type}${ch.username ? ', @' + ch.username : ''})</option>`
       );
       dlAll.innerHTML = items.join('');
 
-      const targetItems = allChs
+      const targetItems = sortedChs
         .filter(ch => ch.can_post)
         .map(ch =>
           `<option value="${ch.id}">${esc(ch.title)} (Your ${ch.type})</option>`
@@ -1537,7 +1536,7 @@ if (document.body.classList.contains('idx-page')) {
     window.closeDr = () => document.querySelector('.ws').classList.remove('drawer-open');
     window.resetActivity = async () => {
       if (!confirm('🛑 WARNING: This will permanently stop ALL active sync rules and CLEAR all activity history. Continue?')) return;
-      try { await api('/api/jobs/reset', { method: 'POST' }); toast('All activity and logs cleared', 'ok'); document.getElementById('plist').innerHTML = ''; document.getElementById('mir-history').innerHTML = ''; document.getElementById('mir-syncs').innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>'; addMirrorCard('sync_activity', 'Live', 'Sync', 'Running'); } catch (e) { toast(e.message, 'err'); }
+      try { await api('/api/jobs/reset', { method: 'POST' }); toast('All activity and logs cleared', 'ok'); document.getElementById('plist').innerHTML = ''; document.getElementById('mir-history').innerHTML = ''; document.getElementById('mir-syncs').innerHTML = '<div style="font-size:11px;color:var(--muted)">No active syncs</div>'; } catch (e) { toast(e.message, 'err'); }
     };
 
     window.loadGlobalGallery = async () => {

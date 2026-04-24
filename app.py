@@ -369,7 +369,7 @@ async def stream_channels(request: Request):
                 "is_creator": is_creator,
                 "can_post": is_admin or is_creator,
             }
-            await _db_run(lambda c=ch: _db_upsert_channel(c))
+            ch["cached_at"] = await _db_run(lambda c=ch: _db_upsert_channel(c))
             yield f"data: {json.dumps(ch)}\n\n"
         yield 'data: {"done":true}\n\n'
 
