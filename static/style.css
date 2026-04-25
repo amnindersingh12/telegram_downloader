@@ -1133,9 +1133,9 @@ input:focus {
   max-height: 200px;
   overflow-y: auto;
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 8px;
   color: var(--muted);
-  line-height: 1.4;
+  line-height: 1;
 }
 .m-logs div {
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
@@ -2916,6 +2916,45 @@ select:focus:not(:focus-visible) {
   padding: 4px 0 4px 6px !important;
 }
 
-.log-line.INFO  { border-left-color: var(--ok); background: linear-gradient(90deg, rgba(48, 209, 88, 0.05) 0%, transparent 100%); }
 .log-line.WARN  { border-left-color: var(--warn); background: linear-gradient(90deg, rgba(255, 159, 10, 0.05) 0%, transparent 100%); }
 .log-line.ERROR { border-left-color: var(--err); background: linear-gradient(90deg, rgba(255, 69, 58, 0.05) 0%, transparent 100%); }
+
+/* ============================================================
+   CHANNEL REFRESH BUTTON
+   ============================================================ */
+.ch-refresh-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease-out);
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+.ch-refresh-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent);
+}
+
+.ch-refresh-btn:hover i {
+  transform: rotate(45deg);
+}
+
+.ch-refresh-btn i {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.4s var(--ease-spring);
+}
+
+.sw {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+}

@@ -63,7 +63,8 @@
   <div id="vapp" class="view">
     <div class="topbar">
       <div class="logo" style="margin:0; gap:10px">
-        <div class="logo-icon" style="width:28px; height:28px; font-size:14px; border-radius:8px; background:var(--accent); color:#fff">
+        <div class="logo-icon"
+          style="width:28px; height:28px; font-size:14px; border-radius:8px; background:var(--accent); color:#fff">
           <i data-lucide="radio"></i>
         </div>
         <div class="logo-text" style="font-size:16px; letter-spacing:-0.5px">TGrab</div>
@@ -73,7 +74,8 @@
       <div style="width:1px; height:20px; background:var(--border); margin:0 8px"></div>
 
       <button class="status-pill" onclick="toggleSidebar()" title="Toggle Sidebar">
-        <i data-lucide="chevron-left" id="sb-toggle-icon" style="width:16px; height:16px; transition: transform 0.3s"></i>
+        <i data-lucide="chevron-left" id="sb-toggle-icon"
+          style="width:16px; height:16px; transition: transform 0.3s"></i>
       </button>
 
 
@@ -86,7 +88,7 @@
           <i data-lucide="search" class="search-icon"></i>
           <input type="text" id="msearch" placeholder="Search library...">
         </div>
-        
+
         <div class="filter-controls">
           <select class="mfilter-dropdown" id="mfilter" onchange="setFilter(this.value)">
             <option value="all">Everything</option>
@@ -125,7 +127,8 @@
     <div class="ws">
       <div class="sidebar" style="position:relative">
         <div class="stabs">
-          <div class="stab active" onclick="switchSTab('channels',this)" title="Channels"><i data-lucide="radio"></i></div>
+          <div class="stab active" onclick="switchSTab('channels',this)" title="Channels"><i data-lucide="radio"></i>
+          </div>
           <div class="stab" onclick="switchSTab('gallery',this)" title="Gallery"><i data-lucide="image"></i></div>
           <div class="stab" onclick="switchSTab('external',this)" title="External"><i data-lucide="globe"></i></div>
           <div class="stab" onclick="switchSTab('mirror',this)" title="Mirror"><i data-lucide="copy"></i></div>
@@ -135,8 +138,12 @@
         <!-- Channels pane -->
         <div class="sidebar-pane active" id="sp-channels">
           <div class="ss">
-            <div class="sw"><span class="si">🔍</span>
+            <div class="sw">
+              <span class="si">🔍</span>
               <input type="text" placeholder="Search channels…" oninput="filterChs(this.value)">
+              <button class="ch-refresh-btn" onclick="loadChannelsSSE()" title="Refresh Channel List">
+                <i data-lucide="refresh-cw"></i>
+              </button>
             </div>
           </div>
           <div id="ftabs" class="ftabs"></div>
@@ -229,11 +236,15 @@
           <div class="pill-count"><b id="sel-count">0</b> items marked</div>
           <div class="pill-divider"></div>
           <div class="pill-actions">
-            <button class="pill-btn primary" onclick="doDl()" title="Download Selected"><i data-lucide="download"></i></button>
-            <button class="pill-btn" onclick="toast('Move logic coming soon', 'info')" title="Move Selected"><i data-lucide="folder-output"></i></button>
-            <button class="pill-btn danger" onclick="toast('Delete logic coming soon', 'err')" title="Delete Selected"><i data-lucide="trash-2"></i></button>
+            <button class="pill-btn primary" onclick="doDl()" title="Download Selected"><i
+                data-lucide="download"></i></button>
+            <button class="pill-btn" onclick="toast('Move logic coming soon', 'info')" title="Move Selected"><i
+                data-lucide="folder-output"></i></button>
+            <button class="pill-btn danger" onclick="toast('Delete logic coming soon', 'err')"
+              title="Delete Selected"><i data-lucide="trash-2"></i></button>
             <div class="pill-divider"></div>
-            <button class="pill-btn" onclick="selItems.clear();updSelCount();renderVirtual()" title="Clear Selection"><i data-lucide="x"></i></button>
+            <button class="pill-btn" onclick="selItems.clear();updSelCount();renderVirtual()" title="Clear Selection"><i
+                data-lucide="x"></i></button>
           </div>
         </div>
 
@@ -257,7 +268,8 @@
           <div class="empty-icon"><i data-lucide="radio" style="width:64px; height:64px"></i></div>
           <div style="font-size:14px;font-weight:500">No media loaded</div>
           <div style="font-size:12px;opacity:.6">Select channels and click "View Media"</div>
-          <div style="font-size:11px;opacity:.4;margin-top:4px">Tip: Ctrl + K for Command Palette · Ctrl + Enter to Download</div>
+          <div style="font-size:11px;opacity:.4;margin-top:4px">Tip: Ctrl + K for Command Palette · Ctrl + Enter to
+            Download</div>
         </div>
 
         <div class="media-grid gallery-mode" id="mgrid" style="display:none"></div>
@@ -282,13 +294,15 @@
           </div>
         </div>
         <div class="sidebar-pane active" style="overflow-y:auto">
-          <div class="s-section-header">System Logs</div>
           <div class="ext-item" style="margin: 0 10px 15px 10px; flex-shrink: 0;">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px">
-              <div class="ext-url" style="min-width:0;flex:1;font-size:13px" title="System Logs">🖥️ System Runtime</div>
-              <button class="vbtn" style="width:auto;flex-shrink:0;padding:4px 12px;font-size:11px;border-radius:20px;background:var(--accent);border:1px solid var(--accent);color:#fff" onclick="const box = document.getElementById('system-logs'); const isV = box.style.display !== 'none'; box.style.display = isV ? 'none' : 'block'; this.textContent = isV ? 'Show Logs' : 'Hide Logs'; this.style.background = isV ? 'var(--adim)' : 'var(--accent)'; this.style.color = isV ? 'var(--accent)' : '#fff';">Hide Logs</button>
+              <div class="ext-url" style="min-width:0;flex:1;font-size:10px" title="System Logs">🖥️ System Runtime
+              </div>
+              <button class="vbtn"
+                style="width:auto;flex-shrink:0;padding:4px 12px;font-size:11px;border-radius:20px;background:var(--accent);border:1px solid var(--accent);color:#fff"
+                onclick="const box = document.getElementById('system-logs'); const isV = box.style.display !== 'none'; box.style.display = isV ? 'none' : 'block'; this.textContent = isV ? 'Show Logs' : 'Hide Logs'; this.style.background = isV ? 'var(--adim)' : 'var(--accent)'; this.style.color = isV ? 'var(--accent)' : '#fff';">Hide
+                Logs</button>
             </div>
-            <div class="ext-status" style="color:var(--muted)">Streaming log events...</div>
             <div id="system-logs" class="m-logs" style="display:block; max-height:400px;"></div>
           </div>
 
@@ -338,7 +352,8 @@
 
   <div id="cp-overlay" class="cp-overlay" onclick="closeCP()">
     <div class="cp-box" onclick="event.stopPropagation()">
-      <input type="text" id="cp-input" class="cp-input" placeholder="Jump to channel, category, or setting..." autocomplete="off">
+      <input type="text" id="cp-input" class="cp-input" placeholder="Jump to channel, category, or setting..."
+        autocomplete="off">
       <div id="cp-results" class="cp-results"></div>
     </div>
   </div>

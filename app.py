@@ -104,8 +104,9 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
             else:
                 logger.info("Restored Telegram session from disk")
                 # Initialize event handlers and sync rules proactively
-                from core import _on_new_message
+                from core import _on_new_message, _on_chat_action
                 st.client.add_event_handler(_on_new_message)
+                st.client.add_event_handler(_on_chat_action)
                 
                 # Load sync rules
                 rules = await _db_run(_db_get_sync_rules)

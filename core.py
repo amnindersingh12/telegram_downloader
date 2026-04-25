@@ -95,6 +95,8 @@ async def _on_new_message(event):
     src_id = event.chat_id
     m = event.message
     
+    # logger.debug(f"New message from {src_id}: {m.id}") # Too noisy for production but good for debug
+
     # ── 1. Live Sync / Mirroring ───────────────────────────────────────────
     if src_id in st.sync_map:
         targets = st.sync_map[src_id]
@@ -153,6 +155,14 @@ async def _on_new_message(event):
             "msg_id": m.id,
             "item": item
         })
+
+
+@events.register(events.ChatAction)
+async def _on_chat_action(event):
+    """Triggered when user joins, is added, or leaves a chat, or a chat is created."""
+    logger.info(f"Chat action detected (Chat: {event.chat_id})")
+    for q in st.queues:
+        q.put_nowait({"type": "refresh_channels"})
 
 
 def _mk_client(api_id: int, api_hash: str) -> TelegramClient:

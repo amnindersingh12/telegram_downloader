@@ -20,6 +20,8 @@ if (document.body.classList.contains('idx-page')) {
     let loadNonce = 0;
     let currentSearch = '';
     let currentSort = '';
+    window.setSort = s => { currentSort = s; applyFilters(); };
+    window.setFilter = f => { filter = f; applyFilters(); };
     let allMediaKeys = [];
     let filteredKeys = [];
     let viewportHeight = 0;
@@ -261,6 +263,7 @@ if (document.body.classList.contains('idx-page')) {
 
     let chES = null;
     function loadChannelsSSE() {
+      window.loadChannelsSSE = loadChannelsSSE;
       if (chES) chES.close();
       const es = new EventSource('/api/channels');
       chES = es;
@@ -502,6 +505,7 @@ if (document.body.classList.contains('idx-page')) {
     }
 
     async function loadMedia(chs = null) {
+      window.loadMedia = loadMedia;
       if (!chs) chs = Array.from(selChs);
       if (chs.length === 0) return;
       if (stream) { stream.close(); stream = null; }
@@ -768,6 +772,10 @@ if (document.body.classList.contains('idx-page')) {
       const es = new EventSource('/api/updates'); window.updateES = es;
       es.onmessage = e => {
         const ev = JSON.parse(e.data);
+        if (ev.type === 'refresh_channels') {
+          console.info('Refreshing channels list (Real-time update)');
+          loadChannelsSSE();
+        }
         if (ev.type === 'new_message') {
           const ch = allChs.find(c => c.id === ev.channel_id);
           if (ch) { ch.unread = (ch.unread || 0) + 1; renderChannelList(); }
