@@ -57,12 +57,19 @@ def _db_init() -> None:
             source_id INTEGER, target_id INTEGER,
             PRIMARY KEY (source_id, target_id)
         );
+        CREATE TABLE IF NOT EXISTS text_messages (
+            channel_id INTEGER, msg_id INTEGER, text TEXT,
+            date TEXT, date_ts INTEGER DEFAULT 0,
+            PRIMARY KEY (channel_id, msg_id)
+        );
         CREATE INDEX IF NOT EXISTS idx_media_channel ON media(channel_id, msg_id DESC);
         CREATE INDEX IF NOT EXISTS idx_media_date ON media(channel_id, date DESC);
         CREATE INDEX IF NOT EXISTS idx_media_filename ON media(filename COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_media_type ON media(channel_id, type);
         CREATE INDEX IF NOT EXISTS idx_downloads_lookup ON downloads(channel_id, msg_id);
         CREATE INDEX IF NOT EXISTS idx_mirrored_lookup ON mirrored_messages(source_id, source_msg_id);
+        CREATE INDEX IF NOT EXISTS idx_text_channel ON text_messages(channel_id, msg_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_text_date ON text_messages(channel_id, date DESC);
         """)
         # Migrate older DBs that lack the caption column
         cols = [r["name"] for r in c.execute("PRAGMA table_info(media)").fetchall()]
@@ -252,3 +259,48 @@ def _db_add_sync_rule(src_id: int, dst_id: int) -> None:
 def _db_remove_sync_rule(src_id: int, dst_id: int) -> None:
     with _db_connect() as c:
         c.execute("DELETE FROM sync_rules WHERE source_id=? AND target_id=?", (src_id, dst_id))
+
+def _db_cache_text_message(item: dict) -> None:
+    _db_cache_text_message_batch([item])
+
+def _db_cache_text_message_batch(items: list[dict]) -> None:
+    if not items:
+        return
+    with _db_connect() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO text_messages (channel_id, msg_id, text, date, date_ts) VALUES (?,?,?,?,?)",
+            [(i["channel_id"], i["msg_id"], i["text"], i.get("date"), i.get("date_ts", 0))
+             for i in items],
+        )
+
+def _db_get_text_messages(channel_id: int, limit: int = 5000, offset: int = 0) -> list[dict]:
+    with _db_connect() as c:
+        rows = c.execute(
+            f"SELECT * FROM text_messages WHERE channel_id=? ORDER BY msg_id DESC LIMIT {limit} OFFSET {offset}",
+            (channel_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def _db_get_text_messages_bulk(channel_ids: list[int], limit: int = 5000, offset: int = 0, sort: str = "newest") -> list[dict]:
+    with _db_connect() as c:
+        if not channel_ids: return []
+        placeholders = ",".join(["?"] * len(channel_ids))
+
+        sort_sqls = {
+            "newest": "msg_id DESC",
+            "oldest": "msg_id ASC",
+        }
+        order_by = sort_sqls.get(sort, "msg_id DESC")
+
+        rows = c.execute(
+            f"SELECT * FROM text_messages WHERE channel_id IN ({placeholders}) ORDER BY {order_by} LIMIT {limit} OFFSET {offset}",
+            channel_ids
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def _db_last_text_msg_id(channel_id: int) -> int:
+    with _db_connect() as c:
+        row = c.execute(
+            "SELECT MAX(msg_id) FROM text_messages WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        return row[0] or 0

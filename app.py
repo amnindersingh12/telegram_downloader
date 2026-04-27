@@ -75,7 +75,7 @@ logger.addHandler(SSEHandler())
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import PORT, CREDS_FILE, SESSION, DOWNLOADS, PREVIEWS, THUMBS_DIR
-from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule, _db_get_media_bulk
+from db import _db_init, _db_run, _db_read, _db_get_channels, _db_upsert_channel, _db_get_media, _db_is_downloaded, _db_get_mirrors, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule, _db_get_media_bulk, _db_get_text_messages, _db_cache_text_message_batch, _db_last_text_msg_id
 from core import st, _mk_client, _client, _media_sse, _run_download, _run_ytdlp, _run_mirror, \
     _safe_name, _msg_to_item, _hr_size, _media_type, _ext, _size, _get_entity_robust, _restore_jobs, \
     _fetch_thumb, _thumb_worker
@@ -393,6 +393,43 @@ async def get_media(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/messages/text")
+async def get_text_messages(channel_id: int, limit: int = 100, offset: int = 0):
+    rows = await _db_read(lambda: _db_get_text_messages(channel_id, limit=limit, offset=offset))
+    return rows
+
+
+@app.get("/api/messages/text/sync")
+async def sync_text_messages(request: Request, channels: str):
+    ids = [int(x) for x in channels.split(",") if x.strip()]
+    if not ids:
+        raise HTTPException(400, "No channel IDs")
+    from core import _text_sse
+    return StreamingResponse(
+        _text_sse(ids, request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class SendMessageReq(BaseModel):
+    channel_id: Union[int, str]
+    text: str
+
+
+@app.post("/api/send-message")
+async def api_send_message(body: SendMessageReq):
+    c = await _client()
+    try:
+        # Use robust entity lookup to handle numeric IDs and usernames
+        entity = await _get_entity_robust(c, body.channel_id)
+        msg = await c.send_message(entity, body.text)
+        return {"status": "ok", "msg_id": msg.id}
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/thumb/{channel_id}/{msg_id}")

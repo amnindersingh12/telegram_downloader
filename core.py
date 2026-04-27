@@ -11,7 +11,8 @@ from telethon.tl.types import (
 from config import SESSION, DOWNLOADS, THUMB_CACHE_SIZE, MAX_CONCURRENT_DOWNLOADS, JOB_TTL_SECONDS, THUMBS_DIR
 from db import _db_run, _db_read, _db_get_media, _db_last_msg_id, _db_cache_media, \
     _db_is_downloaded, _db_mark_downloaded, _db_cache_media_batch, _db_upsert_mirror, \
-    _db_get_mirrors, _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule
+    _db_get_mirrors, _db_is_mirrored, _db_add_mirror_mapping, _db_get_sync_rules, _db_add_sync_rule, _db_remove_sync_rule, \
+    _db_cache_text_message_batch, _db_last_text_msg_id
 from telethon import TelegramClient, errors, events, utils
 
 logger = logging.getLogger("tgrab")
@@ -147,6 +148,10 @@ async def _on_new_message(event):
         asyncio.create_task(_db_run(lambda: _db_cache_media_batch([item])))
         # Also pre-fetch thumb
         st.thumb_queue.put_nowait((src_id, m.id))
+    
+    text_item = _msg_to_text_item(m, src_id)
+    if text_item:
+        asyncio.create_task(_db_run(lambda: _db_cache_text_message_batch([text_item])))
 
     for q in st.queues:
         q.put_nowait({
@@ -397,6 +402,21 @@ def _msg_to_item(msg: Any, channel_id: int) -> Optional[dict]:
     }
 
 
+def _msg_to_text_item(msg: Any, channel_id: int) -> Optional[dict]:
+    """Convert a text-only message to a text item."""
+    text = (msg.message or "").strip()
+    if not text:
+        return None
+    return {
+        "msg_id": msg.id,
+        "channel_id": channel_id,
+        "type": "text",
+        "text": text,
+        "date": msg.date.isoformat() if msg.date else None,
+        "date_ts": int(msg.date.timestamp()) if msg.date else 0,
+    }
+
+
 _thumb_sem = asyncio.Semaphore(3)
 
 async def _fetch_thumb(channel_id: int, msg_id: int) -> Optional[bytes]:
@@ -583,6 +603,57 @@ async def _media_sse(
                     has_thumb = any((THUMBS_DIR / f"{cid}_{i['msg_id']}{ext}").exists() for ext in (".webp", ".jpg"))
                     if not has_thumb:
                         st.thumb_queue.put_nowait((cid, i["msg_id"]))
+            buf.clear()
+
+    yield 'data: {"done":true}\n\n'
+
+
+async def _text_sse(
+    channel_ids: list[int],
+    request: Request,
+) -> AsyncGenerator[str, None]:
+    c = await _client()
+    for cid in channel_ids:
+        try:
+            yield f"data: {json.dumps({'status': f'Opening channel {cid}...'})}\n\n"
+            entity = await _get_entity_robust(c, cid)
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            continue
+
+        cached = await _db_read(lambda: _db_get_text_messages(cid))
+        last_cached = await _db_read(lambda: _db_last_text_msg_id(cid))
+        if cached:
+            yield f"data: {json.dumps({'batch': cached})}\n\n"
+        
+        min_id = last_cached
+        buf = []
+        new_batch = []
+        async for msg in _iter_with_retry(c, entity, limit=None, min_id=min_id):
+            if await request.is_disconnected():
+                return
+            
+            # Skip messages with media, as those go to the media gallery
+            if msg.media and not isinstance(msg.media, types.MessageMediaWebPage):
+                continue
+
+            item = _msg_to_text_item(msg, cid)
+            if not item:
+                continue
+            
+            buf.append(item)
+            new_batch.append(item)
+            
+            if len(new_batch) >= 50:
+                yield f"data: {json.dumps({'batch': new_batch})}\n\n"
+                new_batch = []
+
+            if len(buf) >= 100:
+                await _db_run(lambda b=list(buf): _db_cache_text_message_batch(b))
+                buf.clear()
+
+        if buf:
+            await _db_run(lambda b=list(buf): _db_cache_text_message_batch(b))
             buf.clear()
 
     yield 'data: {"done":true}\n\n'
