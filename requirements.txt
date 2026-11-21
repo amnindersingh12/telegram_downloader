@@ -3,6 +3,6 @@ telethon>=1.36
 fastapi>=0.164.0
 uvicorn[standard]>=0.32
 yt-dlp>=2026.10.26
-cryptography>=42.0.0
+cryptography>=50.0.2
 python-multipart>=0.0.34
 pydantic>=2.0.0
