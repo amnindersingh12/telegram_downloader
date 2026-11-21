@@ -2,7 +2,7 @@
 telethon>=1.36
 fastapi>=0.115
 uvicorn[standard]>=0.32
-yt-dlp>=2024.1.0
+yt-dlp>=2026.10.26
 cryptography>=42.0.0
 python-multipart>=0.0.9
 pydantic>=2.0.0
